@@ -1071,7 +1071,7 @@ async fn execute_mcp_method(
         page_delay_ms: 100,
     };
 
-    let scopes: Vec<&str> = method.scopes.iter().map(|s| s.as_str()).collect();
+    let scopes: Vec<&str> = crate::select_scope(&method.scopes).into_iter().collect();
     let (token, auth_method) = if let Some(tok) = access_token {
         // Gateway mode: use the pre-authenticated user's Google token.
         (Some(tok.to_string()), crate::executor::AuthMethod::OAuth)
