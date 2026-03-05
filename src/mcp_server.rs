@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Model Context Protocol (MCP) server implementation.
-//! Provides a stdio JSON-RPC server exposing Google Workspace APIs as MCP tools.
+//! Provides both stdio and Streamable HTTP transports exposing Google Workspace APIs as MCP tools.
 
 use crate::discovery::RestResource;
 use crate::error::GwsError;
@@ -21,18 +21,19 @@ use crate::services;
 use clap::{Arg, Command};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
-struct ServerConfig {
-    services: Vec<String>,
-    workflows: bool,
-    _helpers: bool,
+pub(crate) struct ServerConfig {
+    pub services: Vec<String>,
+    pub workflows: bool,
+    pub _helpers: bool,
 }
 
 fn build_mcp_cli() -> Command {
     Command::new("mcp")
-        .about("Starts the MCP server over stdio")
+        .about("Starts the MCP server (stdio or HTTP)")
         .arg(
             Arg::new("services")
                 .long("services")
@@ -54,11 +55,25 @@ fn build_mcp_cli() -> Command {
                 .action(clap::ArgAction::SetTrue)
                 .help("Expose service-specific helpers as tools"),
         )
+        .arg(
+            Arg::new("transport")
+                .long("transport")
+                .short('t')
+                .help("Transport mode: stdio or http")
+                .default_value("stdio")
+                .value_parser(["stdio", "http"]),
+        )
+        .arg(
+            Arg::new("port")
+                .long("port")
+                .short('p')
+                .help("Port for HTTP transport")
+                .default_value("8080")
+                .value_parser(clap::value_parser!(u16)),
+        )
 }
 
-pub async fn start(args: &[String]) -> Result<(), GwsError> {
-    // Parse args
-    let matches = build_mcp_cli().get_matches_from(args);
+fn parse_server_config(matches: &clap::ArgMatches) -> ServerConfig {
     let mut config = ServerConfig {
         services: Vec::new(),
         workflows: matches.get_flag("workflows"),
@@ -77,6 +92,13 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         }
     }
 
+    config
+}
+
+pub async fn start(args: &[String]) -> Result<(), GwsError> {
+    let matches = build_mcp_cli().get_matches_from(args);
+    let config = parse_server_config(&matches);
+
     if config.services.is_empty() {
         eprintln!("[gws mcp] Warning: No services configured. Zero tools will be exposed.");
         eprintln!("[gws mcp] Re-run with: gws mcp -s <service> (e.g., -s drive,gmail,calendar)");
@@ -88,86 +110,28 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         );
     }
 
-    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
+    let transport = matches.get_one::<String>("transport").unwrap().as_str();
 
-    // Cache to hold generated tools configuration so we do not spam fetch from Google discovery
-    let mut tools_cache = None;
-
-    while let Ok(Some(line)) = stdin.next_line().await {
-        if line.trim().is_empty() {
-            continue;
+    match transport {
+        "http" => {
+            let port = *matches.get_one::<u16>("port").unwrap();
+            eprintln!("[gws mcp] Starting HTTP transport on port {port}");
+            http_transport::serve(config, port).await
         }
-
-        match serde_json::from_str::<Value>(&line) {
-            Ok(req) => {
-                let is_notification = req.get("id").is_none();
-                let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-                let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-
-                let result = handle_request(method, &params, &config, &mut tools_cache).await;
-
-                if !is_notification {
-                    let id = req.get("id").unwrap();
-                    let response = match result {
-                        Ok(res) => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": res
-                        }),
-                        Err(e) => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": {
-                                "code": -32603,
-                                "message": e.to_string()
-                            }
-                        }),
-                    };
-
-                    let mut out = match serde_json::to_string(&response) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("[gws mcp] Failed to serialize response: {e}");
-                            continue;
-                        }
-                    };
-                    out.push('\n');
-                    let _ = stdout.write_all(out.as_bytes()).await;
-                    let _ = stdout.flush().await;
-                }
-            }
-            Err(_) => {
-                let response = json!({
-                    "jsonrpc": "2.0",
-                    "id": Value::Null,
-                    "error": {
-                        "code": -32700,
-                        "message": "Parse error"
-                    }
-                });
-                let mut out = match serde_json::to_string(&response) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("[gws mcp] Failed to serialize error response: {e}");
-                        continue;
-                    }
-                };
-                out.push('\n');
-                let _ = stdout.write_all(out.as_bytes()).await;
-                let _ = stdout.flush().await;
-            }
+        _ => {
+            eprintln!("[gws mcp] Starting stdio transport");
+            stdio_transport::serve(config).await
         }
     }
-
-    Ok(())
 }
 
-async fn handle_request(
+// --- Shared request handler ---
+
+pub(crate) async fn handle_request(
     method: &str,
     params: &Value,
     config: &ServerConfig,
-    tools_cache: &mut Option<Vec<Value>>,
+    tools_cache: &Mutex<Option<Vec<Value>>>,
 ) -> Result<Value, GwsError> {
     match method {
         "initialize" => Ok(json!({
@@ -180,16 +144,14 @@ async fn handle_request(
                 "tools": {}
             }
         })),
-        "notifications/initialized" => {
-            // Do nothing
-            Ok(json!({}))
-        }
+        "notifications/initialized" => Ok(json!({})),
         "tools/list" => {
-            if tools_cache.is_none() {
-                *tools_cache = Some(build_tools_list(config).await?);
+            let mut cache = tools_cache.lock().await;
+            if cache.is_none() {
+                *cache = Some(build_tools_list(config).await?);
             }
             Ok(json!({
-                "tools": tools_cache.as_ref().unwrap()
+                "tools": cache.as_ref().unwrap()
             }))
         }
         "tools/call" => handle_tools_call(params, config).await,
@@ -200,10 +162,640 @@ async fn handle_request(
     }
 }
 
+pub(crate) fn build_jsonrpc_response(id: &Value, result: Result<Value, GwsError>) -> Value {
+    match result {
+        Ok(res) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": res
+        }),
+        Err(e) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32603,
+                "message": e.to_string()
+            }
+        }),
+    }
+}
+
+pub(crate) fn build_parse_error_response() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": Value::Null,
+        "error": {
+            "code": -32700,
+            "message": "Parse error"
+        }
+    })
+}
+
+// --- stdio transport ---
+
+mod stdio_transport {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    pub async fn serve(config: ServerConfig) -> Result<(), GwsError> {
+        let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+        let mut stdout = tokio::io::stdout();
+        let tools_cache = Mutex::new(None);
+
+        while let Ok(Some(line)) = stdin.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let response = match serde_json::from_str::<Value>(&line) {
+                Ok(req) => {
+                    let is_notification = req.get("id").is_none();
+                    if is_notification {
+                        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+                        let _ = handle_request(method, &params, &config, &tools_cache).await;
+                        continue;
+                    }
+
+                    let id = req.get("id").unwrap().clone();
+                    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                    let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+                    let result = handle_request(method, &params, &config, &tools_cache).await;
+                    build_jsonrpc_response(&id, result)
+                }
+                Err(_) => build_parse_error_response(),
+            };
+
+            let mut out = match serde_json::to_string(&response) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[gws mcp] Failed to serialize response: {e}");
+                    continue;
+                }
+            };
+            out.push('\n');
+            let _ = stdout.write_all(out.as_bytes()).await;
+            let _ = stdout.flush().await;
+        }
+
+        Ok(())
+    }
+}
+
+// --- HTTP (Streamable HTTP) transport ---
+
+mod http_transport {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::{delete, get, post};
+    use axum::Router;
+    use std::collections::HashSet;
+
+    struct AppState {
+        config: ServerConfig,
+        tools_cache: Mutex<Option<Vec<Value>>>,
+        sessions: Mutex<HashSet<String>>,
+    }
+
+    pub async fn serve(config: ServerConfig, port: u16) -> Result<(), GwsError> {
+        let state = Arc::new(AppState {
+            config,
+            tools_cache: Mutex::new(None),
+            sessions: Mutex::new(HashSet::new()),
+        });
+
+        let app = Router::new()
+            .route("/mcp", post(handle_post))
+            .route("/mcp", get(handle_get))
+            .route("/mcp", delete(handle_delete))
+            .with_state(state);
+
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| GwsError::Other(anyhow::anyhow!("Failed to bind to {addr}: {e}")))?;
+
+        eprintln!("[gws mcp] HTTP server listening on http://{addr}/mcp");
+
+        axum::serve(listener, app)
+            .await
+            .map_err(|e| GwsError::Other(anyhow::anyhow!("HTTP server error: {e}")))?;
+
+        Ok(())
+    }
+
+    fn get_session_id(headers: &HeaderMap) -> Option<String> {
+        headers
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    }
+
+    /// POST /mcp - Handle JSON-RPC requests
+    async fn handle_post(
+        State(state): State<Arc<AppState>>,
+        headers: HeaderMap,
+        body: String,
+    ) -> Response {
+        // Validate Accept header includes application/json
+        if let Some(accept) = headers.get("accept").and_then(|v| v.to_str().ok()) {
+            if !accept.contains("application/json") && !accept.contains("*/*") {
+                return (
+                    StatusCode::NOT_ACCEPTABLE,
+                    "Accept header must include application/json",
+                )
+                    .into_response();
+            }
+        }
+
+        // Parse JSON-RPC request
+        let req: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                let error_resp = build_parse_error_response();
+                return (
+                    StatusCode::OK,
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    )],
+                    serde_json::to_string(&error_resp).unwrap(),
+                )
+                    .into_response();
+            }
+        };
+
+        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+        let is_notification = req.get("id").is_none();
+
+        // For non-initialize requests, validate session ID
+        if method != "initialize" {
+            let session_id = get_session_id(&headers);
+            let sessions = state.sessions.lock().await;
+            match session_id {
+                Some(ref id) if sessions.contains(id) => {}
+                _ => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "Missing or invalid Mcp-Session-Id header",
+                    )
+                        .into_response();
+                }
+            }
+        }
+
+        let result = handle_request(method, &params, &state.config, &state.tools_cache).await;
+
+        // For notifications, return 204 No Content
+        if is_notification {
+            return StatusCode::NO_CONTENT.into_response();
+        }
+
+        let id = req.get("id").unwrap().clone();
+        let response = build_jsonrpc_response(&id, result);
+
+        // For initialize, create a new session
+        let mut resp_headers = HeaderMap::new();
+        if method == "initialize" {
+            let session_id = uuid::Uuid::new_v4().to_string();
+            state
+                .sessions
+                .lock()
+                .await
+                .insert(session_id.clone());
+            resp_headers.insert(
+                "mcp-session-id",
+                HeaderValue::from_str(&session_id).unwrap(),
+            );
+        } else if let Some(sid) = get_session_id(&headers) {
+            resp_headers.insert("mcp-session-id", HeaderValue::from_str(&sid).unwrap());
+        }
+
+        resp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+
+        let body_str = serde_json::to_string(&response).unwrap();
+        (StatusCode::OK, resp_headers, body_str).into_response()
+    }
+
+    /// GET /mcp - SSE endpoint for server-to-client notifications
+    async fn handle_get(
+        State(state): State<Arc<AppState>>,
+        headers: HeaderMap,
+    ) -> Response {
+        // Validate session
+        let session_id = get_session_id(&headers);
+        let sessions = state.sessions.lock().await;
+        match session_id {
+            Some(ref id) if sessions.contains(id) => {}
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Missing or invalid Mcp-Session-Id header",
+                )
+                    .into_response();
+            }
+        }
+
+        // Return an SSE stream that stays open.
+        // For now, we just keep the connection open (no server-initiated notifications yet).
+        let stream = futures_util::stream::pending::<Result<String, std::convert::Infallible>>();
+        let body = Body::from_stream(stream);
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .body(body)
+            .unwrap()
+    }
+
+    /// DELETE /mcp - Terminate session
+    async fn handle_delete(
+        State(state): State<Arc<AppState>>,
+        headers: HeaderMap,
+    ) -> Response {
+        let session_id = get_session_id(&headers);
+        match session_id {
+            Some(ref id) => {
+                let mut sessions = state.sessions.lock().await;
+                if sessions.remove(id) {
+                    StatusCode::OK.into_response()
+                } else {
+                    (StatusCode::NOT_FOUND, "Session not found").into_response()
+                }
+            }
+            None => (
+                StatusCode::BAD_REQUEST,
+                "Missing Mcp-Session-Id header",
+            )
+                .into_response(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use axum::body::to_bytes;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        fn test_state() -> Arc<AppState> {
+            Arc::new(AppState {
+                config: ServerConfig {
+                    services: vec![],
+                    workflows: false,
+                    _helpers: false,
+                },
+                tools_cache: Mutex::new(None),
+                sessions: Mutex::new(HashSet::new()),
+            })
+        }
+
+        fn test_app(state: Arc<AppState>) -> Router {
+            Router::new()
+                .route("/mcp", post(handle_post))
+                .route("/mcp", get(handle_get))
+                .route("/mcp", delete(handle_delete))
+                .with_state(state)
+        }
+
+        #[tokio::test]
+        async fn test_initialize_returns_session_id() {
+            let state = test_state();
+            let app = test_app(state.clone());
+
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {}
+            });
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", "application/json")
+                        .body(Body::from(serde_json::to_string(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(resp.headers().get("mcp-session-id").is_some());
+
+            let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+            let result: Value = serde_json::from_slice(&body_bytes).unwrap();
+            assert_eq!(result["result"]["protocolVersion"], "2024-11-05");
+            assert_eq!(result["result"]["serverInfo"]["name"], "gws-mcp");
+        }
+
+        #[tokio::test]
+        async fn test_tools_list_requires_session() {
+            let state = test_state();
+            let app = test_app(state);
+
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            });
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", "application/json")
+                        .body(Body::from(serde_json::to_string(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn test_tools_list_with_valid_session() {
+            let state = test_state();
+            let app = test_app(state.clone());
+
+            // First, initialize to get a session ID
+            let init_body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {}
+            });
+
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", "application/json")
+                        .body(Body::from(serde_json::to_string(&init_body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let session_id = resp
+                .headers()
+                .get("mcp-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+
+            // Now call tools/list with the session ID
+            let list_body = json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            });
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", "application/json")
+                        .header("mcp-session-id", &session_id)
+                        .body(Body::from(serde_json::to_string(&list_body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+            let result: Value = serde_json::from_slice(&body_bytes).unwrap();
+            assert!(result["result"]["tools"].is_array());
+        }
+
+        #[tokio::test]
+        async fn test_delete_session() {
+            let state = test_state();
+            let app = test_app(state.clone());
+
+            // Initialize
+            let init_body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {}
+            });
+
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", "application/json")
+                        .body(Body::from(serde_json::to_string(&init_body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let session_id = resp
+                .headers()
+                .get("mcp-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+
+            // Delete session
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri("/mcp")
+                        .header("mcp-session-id", &session_id)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            // Verify session is gone - tools/list should fail
+            let list_body = json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            });
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", "application/json")
+                        .header("mcp-session-id", &session_id)
+                        .body(Body::from(serde_json::to_string(&list_body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn test_notification_returns_no_content() {
+            let state = test_state();
+            let app = test_app(state.clone());
+
+            // Initialize first
+            let init_body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {}
+            });
+
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", "application/json")
+                        .body(Body::from(serde_json::to_string(&init_body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let session_id = resp
+                .headers()
+                .get("mcp-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+
+            // Send notification (no "id" field)
+            let notif_body = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            });
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", "application/json")
+                        .header("mcp-session-id", &session_id)
+                        .body(Body::from(serde_json::to_string(&notif_body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        }
+
+        #[tokio::test]
+        async fn test_parse_error() {
+            let state = test_state();
+            let app = test_app(state);
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", "application/json")
+                        .body(Body::from("not valid json"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+            let result: Value = serde_json::from_slice(&body_bytes).unwrap();
+            assert_eq!(result["error"]["code"], -32700);
+        }
+
+        #[tokio::test]
+        async fn test_delete_without_session_header() {
+            let state = test_state();
+            let app = test_app(state);
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri("/mcp")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn test_delete_unknown_session() {
+            let state = test_state();
+            let app = test_app(state);
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri("/mcp")
+                        .header("mcp-session-id", "nonexistent-session")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+    }
+}
+
+// --- Shared tool building logic ---
+
 async fn build_tools_list(config: &ServerConfig) -> Result<Vec<Value>, GwsError> {
     let mut tools = Vec::new();
 
-    // 1. Walk core services
     for svc_name in &config.services {
         let (api_name, version) =
             crate::parse_service_and_version(std::slice::from_ref(svc_name), svc_name)?;
@@ -214,9 +806,7 @@ async fn build_tools_list(config: &ServerConfig) -> Result<Vec<Value>, GwsError>
         }
     }
 
-    // 2. Helpers and Workflows (Not fully mapped yet, but structure is here)
     if config.workflows {
-        // Expose workflows
         tools.push(json!({
             "name": "workflow_standup_report",
             "description": "Today's meetings + open tasks as a standup summary",
@@ -288,7 +878,6 @@ fn walk_resources(prefix: &str, resources: &HashMap<String, RestResource>, tools
                 description = format!("Execute the {} Google API method", tool_name);
             }
 
-            // Generate JSON Schema for MCP input
             let input_schema = json!({
                 "type": "object",
                 "properties": {
@@ -318,7 +907,6 @@ fn walk_resources(prefix: &str, resources: &HashMap<String, RestResource>, tools
             }));
         }
 
-        // Recurse into sub-resources
         if !res.resources.is_empty() {
             walk_resources(&new_prefix, &res.resources, tools);
         }
@@ -364,7 +952,6 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
     let mut current_resources = &doc.resources;
     let mut current_res = None;
 
-    // Walk: ["drive", "files", "list"] — iterate resource path segments between service and method
     for res_name in &parts[1..parts.len() - 1] {
         if let Some(res) = current_resources.get(*res_name) {
             current_res = Some(res);
@@ -399,10 +986,8 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
         .map_err(|e| GwsError::Validation(format!("Failed to serialize body: {e}")))?;
 
     // Security: validate upload path to prevent arbitrary local file reads.
-    // Only allow paths within the current working directory.
     let upload_path = if let Some(raw) = arguments.get("upload").and_then(|v| v.as_str()) {
         let p = std::path::Path::new(raw);
-        // Reject absolute paths and any path that escapes cwd via "../"
         if p.is_absolute() || p.components().any(|c| c == std::path::Component::ParentDir) {
             return Err(GwsError::Validation(format!(
                 "Upload path '{}' is not allowed. Paths must be relative and within the current directory.",
@@ -420,7 +1005,7 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
 
     let pagination = crate::executor::PaginationConfig {
         page_all,
-        page_limit: 100, // Safe default for MCP
+        page_limit: 100,
         page_delay_ms: 100,
     };
 
@@ -449,7 +1034,7 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
         None,
         &crate::helpers::modelarmor::SanitizeMode::Warn,
         &crate::formatter::OutputFormat::default(),
-        true, // capture_output = true!
+        true,
     )
     .await?;
 
