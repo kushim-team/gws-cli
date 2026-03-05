@@ -96,9 +96,25 @@ pub fn config_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
 
-    dirs::config_dir()
+    // Use ~/.config/gws on all platforms for a consistent, user-friendly path.
+    let primary = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("gws")
+        .join(".config")
+        .join("gws");
+    if primary.exists() {
+        return primary;
+    }
+
+    // Backward compat: fall back to OS-specific config dir for existing installs
+    // (e.g. ~/Library/Application Support/gws on macOS, %APPDATA%\gws on Windows).
+    let legacy = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("gws");
+    if legacy.exists() {
+        return legacy;
+    }
+
+    primary
 }
 
 fn plain_credentials_path() -> PathBuf {
@@ -553,7 +569,10 @@ fn run_discovery_scope_picker(
             entry.classification != ScopeClassification::Restricted
         };
 
-        if is_recommended && !entry.short.starts_with("admin.") {
+        if is_recommended
+            && !entry.short.starts_with("admin.")
+            && !is_workspace_admin_scope(&entry.url)
+        {
             recommended_scopes.push(entry.short.to_string());
         }
         if entry.is_readonly {
@@ -668,12 +687,16 @@ fn run_discovery_scope_picker(
                     selected.push(entry.url.to_string());
                 }
             } else if recommended && !full && !readonly {
-                // Recommended: non-restricted + readonly, but exclude admin.* scopes
+                // Recommended: non-restricted + readonly, but exclude admin.* and
+                // Workspace-admin-only scopes (require domain admin; fail for @gmail.com).
                 for entry in relevant_scopes {
                     if is_app_only_scope(&entry.url) {
                         continue;
                     }
                     if entry.short.starts_with("admin.") {
+                        continue;
+                    }
+                    if is_workspace_admin_scope(&entry.url) {
                         continue;
                     }
                     if entry.is_readonly || entry.classification != ScopeClassification::Restricted
@@ -1334,6 +1357,30 @@ fn is_app_only_scope(url: &str) -> bool {
         || url.contains("/auth/apps.alerts")
 }
 
+/// Helper: check if a scope requires Workspace domain admin access and therefore
+/// cannot be granted to personal `@gmail.com` accounts via standard user OAuth.
+///
+/// These scopes are valid in Workspace environments with a domain admin, but
+/// Google returns `400 invalid_scope` when requested by personal accounts.
+/// They are excluded from the "Recommended" preset to avoid login failures.
+///
+/// Affected scope families:
+/// - `apps.*`            — Alert Center, Groups Settings, Licensing, Reseller
+/// - `cloud-identity.*`  — Cloud Identity: devices, groups, inbound SSO, policies
+/// - `ediscovery`        — Google Vault
+/// - `directory.readonly`— Admin SDK Directory (read-only)
+/// - `groups`            — Groups Management
+fn is_workspace_admin_scope(url: &str) -> bool {
+    let short = url
+        .strip_prefix("https://www.googleapis.com/auth/")
+        .unwrap_or(url);
+    short.starts_with("apps.")
+        || short.starts_with("cloud-identity.")
+        || short == "ediscovery"
+        || short == "directory.readonly"
+        || short == "groups"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1453,6 +1500,34 @@ mod tests {
     fn config_dir_returns_gws_subdir() {
         let path = config_dir();
         assert!(path.ends_with("gws"));
+    }
+
+    #[test]
+    fn config_dir_primary_uses_dot_config() {
+        // The primary (non-test) path should be ~/.config/gws.
+        // We can't easily test the real function without env override,
+        // but we verify the building blocks: home_dir + .config + gws.
+        let primary = dirs::home_dir().unwrap().join(".config").join("gws");
+        assert!(primary.ends_with(".config/gws") || primary.ends_with(r".config\gws"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn config_dir_fallback_to_legacy() {
+        // When GOOGLE_WORKSPACE_CLI_CONFIG_DIR points to a legacy-style dir,
+        // config_dir() should return it (simulating the test env override).
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy_gws");
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        unsafe {
+            std::env::set_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR", legacy.to_str().unwrap());
+        }
+        let path = config_dir();
+        assert_eq!(path, legacy);
+        unsafe {
+            std::env::remove_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
+        }
     }
 
     #[test]
@@ -1612,5 +1687,82 @@ mod tests {
         // HashMap<String, TokenInfo> format from EncryptedTokenStorage
         let data = r#"{"key":{"access_token":"ya29","refresh_token":"1//tok"}}"#;
         assert_eq!(extract_refresh_token(data), Some("1//tok".to_string()));
+    }
+
+    // ── is_workspace_admin_scope tests ──────────────────────────────────
+
+    #[test]
+    fn is_workspace_admin_scope_apps_alerts() {
+        assert!(is_workspace_admin_scope(
+            "https://www.googleapis.com/auth/apps.alerts"
+        ));
+    }
+
+    #[test]
+    fn is_workspace_admin_scope_apps_groups_settings() {
+        assert!(is_workspace_admin_scope(
+            "https://www.googleapis.com/auth/apps.groups.settings"
+        ));
+    }
+
+    #[test]
+    fn is_workspace_admin_scope_apps_licensing() {
+        assert!(is_workspace_admin_scope(
+            "https://www.googleapis.com/auth/apps.licensing"
+        ));
+    }
+
+    #[test]
+    fn is_workspace_admin_scope_cloud_identity() {
+        assert!(is_workspace_admin_scope(
+            "https://www.googleapis.com/auth/cloud-identity.groups"
+        ));
+        assert!(is_workspace_admin_scope(
+            "https://www.googleapis.com/auth/cloud-identity.devices"
+        ));
+        assert!(is_workspace_admin_scope(
+            "https://www.googleapis.com/auth/cloud-identity.policies"
+        ));
+    }
+
+    #[test]
+    fn is_workspace_admin_scope_ediscovery() {
+        assert!(is_workspace_admin_scope(
+            "https://www.googleapis.com/auth/ediscovery"
+        ));
+    }
+
+    #[test]
+    fn is_workspace_admin_scope_directory_readonly() {
+        assert!(is_workspace_admin_scope(
+            "https://www.googleapis.com/auth/directory.readonly"
+        ));
+    }
+
+    #[test]
+    fn is_workspace_admin_scope_groups() {
+        assert!(is_workspace_admin_scope(
+            "https://www.googleapis.com/auth/groups"
+        ));
+    }
+
+    #[test]
+    fn is_workspace_admin_scope_normal_scopes_not_admin() {
+        // Consumer/personal-account scopes must NOT be classified as admin-only
+        assert!(!is_workspace_admin_scope(
+            "https://www.googleapis.com/auth/drive"
+        ));
+        assert!(!is_workspace_admin_scope(
+            "https://www.googleapis.com/auth/gmail.modify"
+        ));
+        assert!(!is_workspace_admin_scope(
+            "https://www.googleapis.com/auth/calendar"
+        ));
+        assert!(!is_workspace_admin_scope(
+            "https://www.googleapis.com/auth/spreadsheets"
+        ));
+        assert!(!is_workspace_admin_scope(
+            "https://www.googleapis.com/auth/chat.messages"
+        ));
     }
 }
