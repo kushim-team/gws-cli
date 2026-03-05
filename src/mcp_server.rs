@@ -71,6 +71,18 @@ fn build_mcp_cli() -> Command {
                 .default_value("8080")
                 .value_parser(clap::value_parser!(u16)),
         )
+        .arg(
+            Arg::new("host")
+                .long("host")
+                .help("Host address to bind for HTTP transport (use 0.0.0.0 for all interfaces)")
+                .default_value("127.0.0.1"),
+        )
+        .arg(
+            Arg::new("allow-origin")
+                .long("allow-origin")
+                .help("Allowed Origin header values (comma-separated). If unset, localhost origins are allowed by default.")
+                .default_value(""),
+        )
 }
 
 fn parse_server_config(matches: &clap::ArgMatches) -> ServerConfig {
@@ -115,8 +127,13 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
     match transport {
         "http" => {
             let port = *matches.get_one::<u16>("port").unwrap();
-            eprintln!("[gws mcp] Starting HTTP transport on port {port}");
-            http_transport::serve(config, port).await
+            let host = matches.get_one::<String>("host").unwrap().clone();
+            let allow_origin = matches
+                .get_one::<String>("allow-origin")
+                .unwrap()
+                .clone();
+            eprintln!("[gws mcp] Starting HTTP transport on {host}:{port}");
+            http_transport::serve(config, &host, port, &allow_origin).await
         }
         _ => {
             eprintln!("[gws mcp] Starting stdio transport");
@@ -258,13 +275,29 @@ mod http_transport {
         config: ServerConfig,
         tools_cache: Mutex<Option<Vec<Value>>>,
         sessions: Mutex<HashSet<String>>,
+        allowed_origins: Vec<String>,
     }
 
-    pub async fn serve(config: ServerConfig, port: u16) -> Result<(), GwsError> {
+    pub async fn serve(
+        config: ServerConfig,
+        host: &str,
+        port: u16,
+        allow_origin: &str,
+    ) -> Result<(), GwsError> {
+        let allowed_origins: Vec<String> = if allow_origin.is_empty() {
+            vec![]
+        } else {
+            allow_origin
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect()
+        };
+
         let state = Arc::new(AppState {
             config,
             tools_cache: Mutex::new(None),
             sessions: Mutex::new(HashSet::new()),
+            allowed_origins,
         });
 
         let app = Router::new()
@@ -273,7 +306,9 @@ mod http_transport {
             .route("/mcp", delete(handle_delete))
             .with_state(state);
 
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        let addr: std::net::SocketAddr = format!("{host}:{port}")
+            .parse()
+            .map_err(|e| GwsError::Other(anyhow::anyhow!("Invalid host address: {e}")))?;
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| GwsError::Other(anyhow::anyhow!("Failed to bind to {addr}: {e}")))?;
@@ -294,25 +329,82 @@ mod http_transport {
             .map(|s| s.to_string())
     }
 
-    /// POST /mcp - Handle JSON-RPC requests
+    /// Validate Origin header to prevent DNS rebinding attacks.
+    /// Returns true if the request is allowed.
+    /// If no Origin header is present (non-browser client), the request is allowed.
+    fn validate_origin(headers: &HeaderMap, allowed_origins: &[String]) -> bool {
+        let origin = match headers.get("origin").and_then(|v| v.to_str().ok()) {
+            Some(o) => o,
+            None => return true,
+        };
+
+        if !allowed_origins.is_empty() {
+            return allowed_origins.iter().any(|a| a == origin);
+        }
+
+        // Default: allow localhost origins only
+        let lower = origin.to_lowercase();
+        lower.starts_with("http://localhost")
+            || lower.starts_with("https://localhost")
+            || lower.starts_with("http://127.0.0.1")
+            || lower.starts_with("https://127.0.0.1")
+            || lower.starts_with("http://[::1]")
+            || lower.starts_with("https://[::1]")
+    }
+
+    /// Validate session ID. Returns Ok(session_id) or an error Response.
+    /// Missing header → 400 Bad Request, unknown/expired session → 404 Not Found.
+    async fn validate_session(
+        headers: &HeaderMap,
+        sessions: &Mutex<HashSet<String>>,
+    ) -> Result<String, Response> {
+        match get_session_id(headers) {
+            Some(id) => {
+                let sessions = sessions.lock().await;
+                if sessions.contains(&id) {
+                    Ok(id)
+                } else {
+                    Err((
+                        StatusCode::NOT_FOUND,
+                        "Session not found or expired",
+                    )
+                        .into_response())
+                }
+            }
+            None => Err((
+                StatusCode::BAD_REQUEST,
+                "Missing Mcp-Session-Id header",
+            )
+                .into_response()),
+        }
+    }
+
+    /// POST /mcp - Handle JSON-RPC requests (single or batch)
     async fn handle_post(
         State(state): State<Arc<AppState>>,
         headers: HeaderMap,
         body: String,
     ) -> Response {
-        // Validate Accept header includes application/json
+        // 1. Origin validation
+        if !validate_origin(&headers, &state.allowed_origins) {
+            return (StatusCode::FORBIDDEN, "Invalid Origin").into_response();
+        }
+
+        // 2. Accept header must include both application/json and text/event-stream
         if let Some(accept) = headers.get("accept").and_then(|v| v.to_str().ok()) {
-            if !accept.contains("application/json") && !accept.contains("*/*") {
+            let has_json = accept.contains("application/json") || accept.contains("*/*");
+            let has_sse = accept.contains("text/event-stream") || accept.contains("*/*");
+            if !has_json || !has_sse {
                 return (
                     StatusCode::NOT_ACCEPTABLE,
-                    "Accept header must include application/json",
+                    "Accept header must include both application/json and text/event-stream",
                 )
                     .into_response();
             }
         }
 
-        // Parse JSON-RPC request
-        let req: Value = match serde_json::from_str(&body) {
+        // 3. Parse body — single object or JSON-RPC batch array
+        let parsed: Value = match serde_json::from_str(&body) {
             Ok(v) => v,
             Err(_) => {
                 let error_resp = build_parse_error_response();
@@ -328,59 +420,97 @@ mod http_transport {
             }
         };
 
-        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-        let is_notification = req.get("id").is_none();
+        let (messages, is_batch) = if let Some(arr) = parsed.as_array() {
+            (arr.clone(), true)
+        } else {
+            (vec![parsed], false)
+        };
 
-        // For non-initialize requests, validate session ID
-        if method != "initialize" {
-            let session_id = get_session_id(&headers);
-            let sessions = state.sessions.lock().await;
-            match session_id {
-                Some(ref id) if sessions.contains(id) => {}
-                _ => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        "Missing or invalid Mcp-Session-Id header",
-                    )
-                        .into_response();
-                }
+        if messages.is_empty() {
+            let error_resp = json!({
+                "jsonrpc": "2.0",
+                "id": Value::Null,
+                "error": { "code": -32600, "message": "Invalid Request: empty batch" }
+            });
+            return (
+                StatusCode::OK,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                )],
+                serde_json::to_string(&error_resp).unwrap(),
+            )
+                .into_response();
+        }
+
+        // Check if any message is an initialize request
+        let has_initialize = messages
+            .iter()
+            .any(|m| m.get("method").and_then(|v| v.as_str()) == Some("initialize"));
+
+        // Session validation for non-initialize requests
+        if !has_initialize {
+            if let Err(resp) = validate_session(&headers, &state.sessions).await {
+                return resp;
             }
         }
 
-        let result = handle_request(method, &params, &state.config, &state.tools_cache).await;
+        // 4. Process each message
+        let mut responses = Vec::new();
+        let mut new_session_id: Option<String> = None;
 
-        // For notifications, return 204 No Content
-        if is_notification {
-            return StatusCode::NO_CONTENT.into_response();
+        for msg in &messages {
+            let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
+            let has_id = msg.get("id").is_some();
+            let has_method = msg.get("method").is_some();
+
+            // Notification (no id) or client response (id but no method) → process, no response
+            if !has_id || !has_method {
+                if has_method {
+                    let _ =
+                        handle_request(method, &params, &state.config, &state.tools_cache).await;
+                }
+                continue;
+            }
+
+            // JSON-RPC request (has both id and method)
+            let id = msg.get("id").unwrap().clone();
+            let result = handle_request(method, &params, &state.config, &state.tools_cache).await;
+            let response = build_jsonrpc_response(&id, result);
+
+            if method == "initialize" {
+                let session_id = uuid::Uuid::new_v4().to_string();
+                state.sessions.lock().await.insert(session_id.clone());
+                new_session_id = Some(session_id);
+            }
+
+            responses.push(response);
         }
 
-        let id = req.get("id").unwrap().clone();
-        let response = build_jsonrpc_response(&id, result);
+        // 5. If all messages were notifications/responses, return 202 Accepted
+        if responses.is_empty() {
+            return StatusCode::ACCEPTED.into_response();
+        }
 
-        // For initialize, create a new session
+        // 6. Build HTTP response
         let mut resp_headers = HeaderMap::new();
-        if method == "initialize" {
-            let session_id = uuid::Uuid::new_v4().to_string();
-            state
-                .sessions
-                .lock()
-                .await
-                .insert(session_id.clone());
-            resp_headers.insert(
-                "mcp-session-id",
-                HeaderValue::from_str(&session_id).unwrap(),
-            );
+        if let Some(ref sid) = new_session_id {
+            resp_headers.insert("mcp-session-id", HeaderValue::from_str(sid).unwrap());
         } else if let Some(sid) = get_session_id(&headers) {
             resp_headers.insert("mcp-session-id", HeaderValue::from_str(&sid).unwrap());
         }
-
         resp_headers.insert(
             axum::http::header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
 
-        let body_str = serde_json::to_string(&response).unwrap();
+        let body_str = if is_batch {
+            serde_json::to_string(&responses).unwrap()
+        } else {
+            serde_json::to_string(&responses[0]).unwrap()
+        };
+
         (StatusCode::OK, resp_headers, body_str).into_response()
     }
 
@@ -389,18 +519,25 @@ mod http_transport {
         State(state): State<Arc<AppState>>,
         headers: HeaderMap,
     ) -> Response {
-        // Validate session
-        let session_id = get_session_id(&headers);
-        let sessions = state.sessions.lock().await;
-        match session_id {
-            Some(ref id) if sessions.contains(id) => {}
-            _ => {
+        // Origin validation
+        if !validate_origin(&headers, &state.allowed_origins) {
+            return (StatusCode::FORBIDDEN, "Invalid Origin").into_response();
+        }
+
+        // Accept header must include text/event-stream
+        if let Some(accept) = headers.get("accept").and_then(|v| v.to_str().ok()) {
+            if !accept.contains("text/event-stream") && !accept.contains("*/*") {
                 return (
-                    StatusCode::BAD_REQUEST,
-                    "Missing or invalid Mcp-Session-Id header",
+                    StatusCode::NOT_ACCEPTABLE,
+                    "Accept header must include text/event-stream",
                 )
                     .into_response();
             }
+        }
+
+        // Session validation (404 for unknown, 400 for missing)
+        if let Err(resp) = validate_session(&headers, &state.sessions).await {
+            return resp;
         }
 
         // Return an SSE stream that stays open.
@@ -421,6 +558,11 @@ mod http_transport {
         State(state): State<Arc<AppState>>,
         headers: HeaderMap,
     ) -> Response {
+        // Origin validation
+        if !validate_origin(&headers, &state.allowed_origins) {
+            return (StatusCode::FORBIDDEN, "Invalid Origin").into_response();
+        }
+
         let session_id = get_session_id(&headers);
         match session_id {
             Some(ref id) => {
@@ -446,7 +588,13 @@ mod http_transport {
         use axum::http::Request;
         use tower::ServiceExt;
 
+        const ACCEPT_MCP: &str = "application/json, text/event-stream";
+
         fn test_state() -> Arc<AppState> {
+            test_state_with_origins(vec![])
+        }
+
+        fn test_state_with_origins(allowed_origins: Vec<String>) -> Arc<AppState> {
             Arc::new(AppState {
                 config: ServerConfig {
                     services: vec![],
@@ -455,6 +603,7 @@ mod http_transport {
                 },
                 tools_cache: Mutex::new(None),
                 sessions: Mutex::new(HashSet::new()),
+                allowed_origins,
             })
         }
 
@@ -464,6 +613,35 @@ mod http_transport {
                 .route("/mcp", get(handle_get))
                 .route("/mcp", delete(handle_delete))
                 .with_state(state)
+        }
+
+        /// Helper: send an initialize request and return the session ID.
+        async fn init_session(app: &Router) -> String {
+            let init_body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {}
+            });
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", ACCEPT_MCP)
+                        .body(Body::from(serde_json::to_string(&init_body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            resp.headers()
+                .get("mcp-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
         }
 
         #[tokio::test]
@@ -484,7 +662,7 @@ mod http_transport {
                         .method("POST")
                         .uri("/mcp")
                         .header("content-type", "application/json")
-                        .header("accept", "application/json")
+                        .header("accept", ACCEPT_MCP)
                         .body(Body::from(serde_json::to_string(&body).unwrap()))
                         .unwrap(),
                 )
@@ -518,13 +696,14 @@ mod http_transport {
                         .method("POST")
                         .uri("/mcp")
                         .header("content-type", "application/json")
-                        .header("accept", "application/json")
+                        .header("accept", ACCEPT_MCP)
                         .body(Body::from(serde_json::to_string(&body).unwrap()))
                         .unwrap(),
                 )
                 .await
                 .unwrap();
 
+            // No session header → 400 Bad Request
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         }
 
@@ -532,38 +711,8 @@ mod http_transport {
         async fn test_tools_list_with_valid_session() {
             let state = test_state();
             let app = test_app(state.clone());
+            let session_id = init_session(&app).await;
 
-            // First, initialize to get a session ID
-            let init_body = json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {}
-            });
-
-            let resp = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/mcp")
-                        .header("content-type", "application/json")
-                        .header("accept", "application/json")
-                        .body(Body::from(serde_json::to_string(&init_body).unwrap()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-
-            let session_id = resp
-                .headers()
-                .get("mcp-session-id")
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string();
-
-            // Now call tools/list with the session ID
             let list_body = json!({
                 "jsonrpc": "2.0",
                 "id": 2,
@@ -577,7 +726,7 @@ mod http_transport {
                         .method("POST")
                         .uri("/mcp")
                         .header("content-type", "application/json")
-                        .header("accept", "application/json")
+                        .header("accept", ACCEPT_MCP)
                         .header("mcp-session-id", &session_id)
                         .body(Body::from(serde_json::to_string(&list_body).unwrap()))
                         .unwrap(),
@@ -595,36 +744,7 @@ mod http_transport {
         async fn test_delete_session() {
             let state = test_state();
             let app = test_app(state.clone());
-
-            // Initialize
-            let init_body = json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {}
-            });
-
-            let resp = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/mcp")
-                        .header("content-type", "application/json")
-                        .header("accept", "application/json")
-                        .body(Body::from(serde_json::to_string(&init_body).unwrap()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-
-            let session_id = resp
-                .headers()
-                .get("mcp-session-id")
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string();
+            let session_id = init_session(&app).await;
 
             // Delete session
             let resp = app
@@ -642,7 +762,7 @@ mod http_transport {
 
             assert_eq!(resp.status(), StatusCode::OK);
 
-            // Verify session is gone - tools/list should fail
+            // Verify session is gone — terminated session returns 404
             let list_body = json!({
                 "jsonrpc": "2.0",
                 "id": 2,
@@ -656,7 +776,7 @@ mod http_transport {
                         .method("POST")
                         .uri("/mcp")
                         .header("content-type", "application/json")
-                        .header("accept", "application/json")
+                        .header("accept", ACCEPT_MCP)
                         .header("mcp-session-id", &session_id)
                         .body(Body::from(serde_json::to_string(&list_body).unwrap()))
                         .unwrap(),
@@ -664,45 +784,16 @@ mod http_transport {
                 .await
                 .unwrap();
 
-            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         }
 
         #[tokio::test]
-        async fn test_notification_returns_no_content() {
+        async fn test_notification_returns_accepted() {
             let state = test_state();
             let app = test_app(state.clone());
+            let session_id = init_session(&app).await;
 
-            // Initialize first
-            let init_body = json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {}
-            });
-
-            let resp = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/mcp")
-                        .header("content-type", "application/json")
-                        .header("accept", "application/json")
-                        .body(Body::from(serde_json::to_string(&init_body).unwrap()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-
-            let session_id = resp
-                .headers()
-                .get("mcp-session-id")
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string();
-
-            // Send notification (no "id" field)
+            // Send notification (no "id" field) → 202 Accepted
             let notif_body = json!({
                 "jsonrpc": "2.0",
                 "method": "notifications/initialized",
@@ -715,7 +806,7 @@ mod http_transport {
                         .method("POST")
                         .uri("/mcp")
                         .header("content-type", "application/json")
-                        .header("accept", "application/json")
+                        .header("accept", ACCEPT_MCP)
                         .header("mcp-session-id", &session_id)
                         .body(Body::from(serde_json::to_string(&notif_body).unwrap()))
                         .unwrap(),
@@ -723,7 +814,7 @@ mod http_transport {
                 .await
                 .unwrap();
 
-            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
         }
 
         #[tokio::test]
@@ -737,7 +828,7 @@ mod http_transport {
                         .method("POST")
                         .uri("/mcp")
                         .header("content-type", "application/json")
-                        .header("accept", "application/json")
+                        .header("accept", ACCEPT_MCP)
                         .body(Body::from("not valid json"))
                         .unwrap(),
                 )
@@ -780,6 +871,276 @@ mod http_transport {
                         .method("DELETE")
                         .uri("/mcp")
                         .header("mcp-session-id", "nonexistent-session")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        // --- New tests for MCP spec compliance ---
+
+        #[tokio::test]
+        async fn test_invalid_session_returns_not_found() {
+            let state = test_state();
+            let app = test_app(state);
+
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            });
+
+            // Present but invalid session ID → 404 Not Found
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", ACCEPT_MCP)
+                        .header("mcp-session-id", "does-not-exist")
+                        .body(Body::from(serde_json::to_string(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn test_batch_request() {
+            let state = test_state();
+            let app = test_app(state.clone());
+            let session_id = init_session(&app).await;
+
+            let batch = json!([
+                {
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "tools/list",
+                    "params": {}
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {}
+                }
+            ]);
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", ACCEPT_MCP)
+                        .header("mcp-session-id", &session_id)
+                        .body(Body::from(serde_json::to_string(&batch).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+            let result: Value = serde_json::from_slice(&body_bytes).unwrap();
+            // Batch response is an array
+            assert!(result.is_array());
+            let arr = result.as_array().unwrap();
+            // Only 1 response (notification doesn't get a response)
+            assert_eq!(arr.len(), 1);
+            assert_eq!(arr[0]["id"], 10);
+        }
+
+        #[tokio::test]
+        async fn test_batch_all_notifications_returns_accepted() {
+            let state = test_state();
+            let app = test_app(state.clone());
+            let session_id = init_session(&app).await;
+
+            let batch = json!([
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {}
+                }
+            ]);
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", ACCEPT_MCP)
+                        .header("mcp-session-id", &session_id)
+                        .body(Body::from(serde_json::to_string(&batch).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        }
+
+        #[tokio::test]
+        async fn test_origin_validation_rejects_bad_origin() {
+            let state = test_state();
+            let app = test_app(state);
+
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {}
+            });
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", ACCEPT_MCP)
+                        .header("origin", "https://evil.example.com")
+                        .body(Body::from(serde_json::to_string(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn test_origin_validation_allows_localhost() {
+            let state = test_state();
+            let app = test_app(state);
+
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {}
+            });
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", ACCEPT_MCP)
+                        .header("origin", "http://localhost:3000")
+                        .body(Body::from(serde_json::to_string(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn test_origin_validation_allows_configured_origin() {
+            let state =
+                test_state_with_origins(vec!["https://my-app.example.com".to_string()]);
+            let app = test_app(state);
+
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {}
+            });
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", ACCEPT_MCP)
+                        .header("origin", "https://my-app.example.com")
+                        .body(Body::from(serde_json::to_string(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn test_accept_header_missing_event_stream() {
+            let state = test_state();
+            let app = test_app(state);
+
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {}
+            });
+
+            // Only application/json without text/event-stream → 406
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", "application/json")
+                        .body(Body::from(serde_json::to_string(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE);
+        }
+
+        #[tokio::test]
+        async fn test_get_requires_accept_event_stream() {
+            let state = test_state();
+            let app = test_app(state.clone());
+            let session_id = init_session(&app).await;
+
+            // GET with wrong Accept → 406
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/mcp")
+                        .header("accept", "application/json")
+                        .header("mcp-session-id", &session_id)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE);
+        }
+
+        #[tokio::test]
+        async fn test_get_invalid_session_returns_not_found() {
+            let state = test_state();
+            let app = test_app(state);
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/mcp")
+                        .header("accept", "text/event-stream")
+                        .header("mcp-session-id", "does-not-exist")
                         .body(Body::empty())
                         .unwrap(),
                 )
