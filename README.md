@@ -3,6 +3,9 @@
 **One CLI for all of Google Workspace — built for humans and AI agents.**<br>
 Drive, Gmail, Calendar, and every Workspace API. Zero boilerplate. Structured JSON output. 40+ agent skills included.
 
+> [!IMPORTANT]
+> Temporarily disabling non-collaborator pull requests. See this discussion, https://github.com/googleworkspace/cli/discussions/249.
+
 > [!NOTE]
 > This is a fork of [googleworkspace/cli](https://github.com/googleworkspace/cli) maintained by **HODL1** (kushim-team).
 > This is **not** an officially supported Google product.
