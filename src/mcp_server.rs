@@ -1099,12 +1099,13 @@ async fn execute_mcp_method(
     };
 
     let scopes: Vec<&str> = crate::select_scope(&method.scopes).into_iter().collect();
+    let account = std::env::var("GOOGLE_WORKSPACE_CLI_ACCOUNT").ok();
     let (token, auth_method) = if let Some(tok) = access_token {
         // Gateway mode: use the pre-authenticated user's Google token.
         (Some(tok.to_string()), crate::executor::AuthMethod::OAuth)
     } else {
         // Local mode: use local credentials.
-        match crate::auth::get_token(&scopes, None).await {
+        match crate::auth::get_token(&scopes, account.as_deref()).await {
             Ok(t) => (Some(t), crate::executor::AuthMethod::OAuth),
             Err(e) => {
                 eprintln!(
