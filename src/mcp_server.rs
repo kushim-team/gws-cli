@@ -88,13 +88,13 @@ fn build_mcp_cli() -> Command {
         .arg(
             Arg::new("oauth-client-id")
                 .long("oauth-client-id")
-                .help("Google OAuth client ID for gateway auth (env: GWS_OAUTH_CLIENT_ID)")
-                .env("GWS_OAUTH_CLIENT_ID"),
+                .help("Google OAuth client ID for gateway auth (env: GOOGLE_WORKSPACE_CLI_CLIENT_ID)")
+                .env("GOOGLE_WORKSPACE_CLI_CLIENT_ID"),
         )
         .arg(
             Arg::new("oauth-client-secret")
                 .help("Google OAuth client secret (env only, not accepted as CLI arg)")
-                .env("GWS_OAUTH_CLIENT_SECRET")
+                .env("GOOGLE_WORKSPACE_CLI_CLIENT_SECRET")
                 .hide(true),
         )
         .arg(
