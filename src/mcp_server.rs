@@ -333,12 +333,11 @@ mod http_transport {
     use axum::response::{IntoResponse, Response};
     use axum::routing::{delete, get, post};
     use axum::Router;
-    use std::collections::HashSet;
-
     struct AppState {
         config: ServerConfig,
         tools_cache: Mutex<Option<Vec<Value>>>,
-        sessions: Mutex<HashSet<String>>,
+        /// Maps session_id -> bearer_token (or empty string when OAuth is disabled).
+        sessions: Mutex<HashMap<String, String>>,
         allowed_origins: Vec<String>,
         oauth_config: Option<OAuthConfig>,
         token_store: Mutex<TokenStore>,
@@ -363,7 +362,7 @@ mod http_transport {
         let state = Arc::new(AppState {
             config,
             tools_cache: Mutex::new(None),
-            sessions: Mutex::new(HashSet::new()),
+            sessions: Mutex::new(HashMap::new()),
             allowed_origins,
             oauth_config,
             token_store: Mutex::new(TokenStore::new()),
@@ -427,15 +426,31 @@ mod http_transport {
 
     async fn validate_session(
         headers: &HeaderMap,
-        sessions: &Mutex<HashSet<String>>,
+        sessions: &Mutex<HashMap<String, String>>,
+        oauth_enabled: bool,
     ) -> Result<String, Response> {
         match get_session_id(headers) {
             Some(id) => {
                 let sessions = sessions.lock().await;
-                if sessions.contains(&id) {
-                    Ok(id)
-                } else {
-                    Err((StatusCode::NOT_FOUND, "Session not found or expired").into_response())
+                match sessions.get(&id) {
+                    Some(bound_bearer) => {
+                        // When OAuth is enabled, verify the bearer token matches the one
+                        // that created this session.
+                        if oauth_enabled {
+                            let bearer = extract_bearer_token(headers).unwrap_or_default();
+                            if bearer != *bound_bearer {
+                                return Err((
+                                    StatusCode::FORBIDDEN,
+                                    "Bearer token does not match session owner",
+                                )
+                                    .into_response());
+                            }
+                        }
+                        Ok(id)
+                    }
+                    None => Err(
+                        (StatusCode::NOT_FOUND, "Session not found or expired").into_response()
+                    ),
                 }
             }
             None => {
@@ -569,10 +584,15 @@ mod http_transport {
             .any(|m| m.get("method").and_then(|v| v.as_str()) == Some("initialize"));
 
         if !has_initialize {
-            if let Err(resp) = validate_session(&headers, &state.sessions).await {
+            if let Err(resp) =
+                validate_session(&headers, &state.sessions, state.oauth_config.is_some()).await
+            {
                 return resp;
             }
         }
+
+        // Extract bearer token for session binding (empty string when OAuth disabled).
+        let bearer_for_binding = extract_bearer_token(&headers).unwrap_or_default();
 
         let mut responses = Vec::new();
         let mut new_session_id: Option<String> = None;
@@ -610,7 +630,11 @@ mod http_transport {
 
             if method == "initialize" {
                 let session_id = oauth::generate_secure_token();
-                state.sessions.lock().await.insert(session_id.clone());
+                state
+                    .sessions
+                    .lock()
+                    .await
+                    .insert(session_id.clone(), bearer_for_binding.clone());
                 new_session_id = Some(session_id);
             }
 
@@ -661,7 +685,9 @@ mod http_transport {
                     .into_response();
             }
         }
-        if let Err(resp) = validate_session(&headers, &state.sessions).await {
+        if let Err(resp) =
+            validate_session(&headers, &state.sessions, state.oauth_config.is_some()).await
+        {
             return resp;
         }
 
@@ -686,18 +712,14 @@ mod http_transport {
         if let Err(resp) = resolve_google_token(&headers, &state).await {
             return resp;
         }
-        match get_session_id(&headers) {
-            Some(ref id) => {
+        // Validate session exists and bearer matches owner.
+        match validate_session(&headers, &state.sessions, state.oauth_config.is_some()).await {
+            Ok(id) => {
                 let mut sessions = state.sessions.lock().await;
-                if sessions.remove(id) {
-                    StatusCode::OK.into_response()
-                } else {
-                    (StatusCode::NOT_FOUND, "Session not found").into_response()
-                }
+                sessions.remove(&id);
+                StatusCode::OK.into_response()
             }
-            None => {
-                (StatusCode::BAD_REQUEST, "Missing Mcp-Session-Id header").into_response()
-            }
+            Err(resp) => resp,
         }
     }
 
@@ -1326,7 +1348,7 @@ mod http_transport {
                     _helpers: false,
                 },
                 tools_cache: Mutex::new(None),
-                sessions: Mutex::new(HashSet::new()),
+                sessions: Mutex::new(HashMap::new()),
                 allowed_origins,
                 oauth_config: None,
                 token_store: Mutex::new(TokenStore::new()),
@@ -1341,7 +1363,7 @@ mod http_transport {
                     _helpers: false,
                 },
                 tools_cache: Mutex::new(None),
-                sessions: Mutex::new(HashSet::new()),
+                sessions: Mutex::new(HashMap::new()),
                 allowed_origins: vec![],
                 oauth_config: Some(OAuthConfig {
                     client_id: "test-client-id".to_string(),
@@ -2262,6 +2284,83 @@ mod http_transport {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn test_session_bearer_binding_rejects_wrong_bearer() {
+            let state = test_state_with_oauth();
+            // Register two bearer tokens.
+            {
+                let mut store = state.token_store.lock().await;
+                store
+                    .bearer_sessions
+                    .insert("bearer-a".to_string(), make_bearer_session());
+                store
+                    .bearer_sessions
+                    .insert("bearer-b".to_string(), make_bearer_session());
+            }
+            // Create a session with bearer-a via initialize.
+            let app = test_app(state.clone());
+            let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", ACCEPT_MCP)
+                        .header("authorization", "Bearer bearer-a")
+                        .body(Body::from(serde_json::to_string(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let session_id = resp
+                .headers()
+                .get("mcp-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+
+            // bearer-b should be FORBIDDEN from using bearer-a's session.
+            let app = test_app(state.clone());
+            let body2 =
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", ACCEPT_MCP)
+                        .header("authorization", "Bearer bearer-b")
+                        .header("mcp-session-id", &session_id)
+                        .body(Body::from(serde_json::to_string(&body2).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+            // bearer-a should still work with its own session.
+            let app = test_app(state);
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", "application/json")
+                        .header("accept", ACCEPT_MCP)
+                        .header("authorization", "Bearer bearer-a")
+                        .header("mcp-session-id", &session_id)
+                        .body(Body::from(serde_json::to_string(&body2).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
         }
 
         #[tokio::test]
