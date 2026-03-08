@@ -8,8 +8,8 @@
 | 2 | ユーザーごとの OAuth トークン管理 | Phase 1 | DONE |
 | 3 | Cloud Run にデプロイ | Phase 2 | TODO |
 | 4 | Claude 管理コンソールで組織コネクタとして登録・動作確認 | Phase 3 | TODO |
-| 5 | 権限制御 (YAML ホワイトリスト) | Phase 2 | TODO |
-| 6 | tools/list のユーザー別フィルタ | Phase 5 | TODO |
+| 5 | 権限制御 (YAML ホワイトリスト) | Phase 2 | DONE |
+| 6 | tools/list のユーザー別フィルタ | Phase 5 | DONE |
 | 7 | 利用統計 (Cloud Logging) | Phase 2 | TODO |
 
 ## Phase 詳細
@@ -43,15 +43,15 @@
 
 ### Phase 5: 権限制御
 
-- [ ] YAML パーサー実装
-- [ ] ワイルドカードマッチング実装
-- [ ] リクエスト時の権限チェックミドルウェア
-- [ ] 未登録ユーザーの拒否処理
+- [x] YAML パーサー実装
+- [x] ワイルドカードマッチング実装
+- [x] リクエスト時の権限チェックミドルウェア
+- [x] 未登録ユーザーの拒否処理
 
 ### Phase 6: tools/list フィルタ
 
-- [ ] ユーザー権限に基づく tools/list レスポンスフィルタ
-- [ ] 未登録ユーザーへの空リスト返却
+- [x] ユーザー権限に基づく tools/list レスポンスフィルタ
+- [x] 未登録ユーザーへの空リスト返却
 
 ### Phase 7: 利用統計
 
