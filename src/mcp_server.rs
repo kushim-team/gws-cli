@@ -25,10 +25,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
-pub(crate) struct ServerConfig {
-    pub services: Vec<String>,
-    pub workflows: bool,
-    pub _helpers: bool,
+struct ServerConfig {
+    services: Vec<String>,
+    workflows: bool,
+    _helpers: bool,
 }
 
 fn build_mcp_cli() -> Command {
@@ -144,7 +144,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
 
 // --- Shared request handler ---
 
-pub(crate) async fn handle_request(
+async fn handle_request(
     method: &str,
     params: &Value,
     config: &ServerConfig,
@@ -161,7 +161,10 @@ pub(crate) async fn handle_request(
                 "tools": {}
             }
         })),
-        "notifications/initialized" => Ok(json!({})),
+        "notifications/initialized" => {
+            // Do nothing
+            Ok(json!({}))
+        }
         "tools/list" => {
             let mut cache = tools_cache.lock().await;
             if cache.is_none() {
@@ -179,7 +182,7 @@ pub(crate) async fn handle_request(
     }
 }
 
-pub(crate) fn build_jsonrpc_response(id: &Value, result: Result<Value, GwsError>) -> Value {
+fn build_jsonrpc_response(id: &Value, result: Result<Value, GwsError>) -> Value {
     match result {
         Ok(res) => json!({
             "jsonrpc": "2.0",
@@ -197,7 +200,7 @@ pub(crate) fn build_jsonrpc_response(id: &Value, result: Result<Value, GwsError>
     }
 }
 
-pub(crate) fn build_parse_error_response() -> Value {
+fn build_parse_error_response() -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": Value::Null,
@@ -1157,6 +1160,7 @@ mod http_transport {
 async fn build_tools_list(config: &ServerConfig) -> Result<Vec<Value>, GwsError> {
     let mut tools = Vec::new();
 
+    // 1. Walk core services
     for svc_name in &config.services {
         let (api_name, version) =
             crate::parse_service_and_version(std::slice::from_ref(svc_name), svc_name)?;
@@ -1167,7 +1171,9 @@ async fn build_tools_list(config: &ServerConfig) -> Result<Vec<Value>, GwsError>
         }
     }
 
+    // 2. Helpers and Workflows (Not fully mapped yet, but structure is here)
     if config.workflows {
+        // Expose workflows
         tools.push(json!({
             "name": "workflow_standup_report",
             "description": "Today's meetings + open tasks as a standup summary",
@@ -1239,6 +1245,7 @@ fn walk_resources(prefix: &str, resources: &HashMap<String, RestResource>, tools
                 description = format!("Execute the {} Google API method", tool_name);
             }
 
+            // Generate JSON Schema for MCP input
             let input_schema = json!({
                 "type": "object",
                 "properties": {
@@ -1268,6 +1275,7 @@ fn walk_resources(prefix: &str, resources: &HashMap<String, RestResource>, tools
             }));
         }
 
+        // Recurse into sub-resources
         if !res.resources.is_empty() {
             walk_resources(&new_prefix, &res.resources, tools);
         }
@@ -1313,6 +1321,7 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
     let mut current_resources = &doc.resources;
     let mut current_res = None;
 
+    // Walk: ["drive", "files", "list"] — iterate resource path segments between service and method
     for res_name in &parts[1..parts.len() - 1] {
         if let Some(res) = current_resources.get(*res_name) {
             current_res = Some(res);
@@ -1347,8 +1356,10 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
         .map_err(|e| GwsError::Validation(format!("Failed to serialize body: {e}")))?;
 
     // Security: validate upload path to prevent arbitrary local file reads.
+    // Only allow paths within the current working directory.
     let upload_path = if let Some(raw) = arguments.get("upload").and_then(|v| v.as_str()) {
         let p = std::path::Path::new(raw);
+        // Reject absolute paths and any path that escapes cwd via "../"
         if p.is_absolute() || p.components().any(|c| c == std::path::Component::ParentDir) {
             return Err(GwsError::Validation(format!(
                 "Upload path '{}' is not allowed. Paths must be relative and within the current directory.",
@@ -1366,7 +1377,7 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
 
     let pagination = crate::executor::PaginationConfig {
         page_all,
-        page_limit: 100,
+        page_limit: 100, // Safe default for MCP
         page_delay_ms: 100,
     };
 
@@ -1395,7 +1406,7 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
         None,
         &crate::helpers::modelarmor::SanitizeMode::Warn,
         &crate::formatter::OutputFormat::default(),
-        true,
+        true, // capture_output = true!
     )
     .await?;
 

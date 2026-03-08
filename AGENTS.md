@@ -35,6 +35,20 @@ Upstream updates are merged (not rebased) into `custom` to preserve a clean, sha
 > [!NOTE]
 > **Package Manager**: Use `pnpm` instead of `npm` for Node.js package management in this repository.
 
+## Code Change Discipline
+
+> [!IMPORTANT]
+> **Strictly adhere to the task scope.** Do not make any code changes unrelated to the assigned task.
+>
+> The following "drive-by" changes are **prohibited**:
+> - Deleting or rewriting existing comments (do not tidy up comments in code you are not touching for the task)
+> - Changing visibility (e.g., adding `pub(crate)`) when not required by the task
+> - Reformatting code (except automatic `cargo fmt` formatting)
+> - Renaming variables or refactoring based on style preference
+> - Adding or removing blank lines unnecessarily
+>
+> **Rule of thumb**: If removing a change would leave the task's functionality fully intact, that change is unnecessary. Do not include it.
+
 ## Build & Test
 
 > [!IMPORTANT]
