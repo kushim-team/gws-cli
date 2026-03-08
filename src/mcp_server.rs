@@ -16,6 +16,7 @@
 //! Provides both stdio and Streamable HTTP transports exposing Google Workspace APIs as MCP tools.
 
 pub(crate) mod oauth;
+pub(crate) mod permissions;
 
 use crate::discovery::RestResource;
 use crate::error::GwsError;
@@ -110,6 +111,12 @@ fn build_mcp_cli() -> Command {
                 .env("GWS_OAUTH_SCOPES")
                 .default_value(oauth::DEFAULT_OAUTH_SCOPES),
         )
+        .arg(
+            Arg::new("permissions-file")
+                .long("permissions-file")
+                .help("Path to permissions YAML file (env: GWS_PERMISSIONS_FILE)")
+                .env("GWS_PERMISSIONS_FILE"),
+        )
 }
 
 fn parse_server_config(matches: &clap::ArgMatches) -> ServerConfig {
@@ -202,6 +209,17 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         }
     };
 
+    // Load permissions config if specified.
+    let permissions_config = match matches.get_one::<String>("permissions-file") {
+        Some(path) => {
+            let pc = permissions::PermissionsConfig::load_from_file(path)
+                .map_err(GwsError::Other)?;
+            eprintln!("[gws mcp] Permissions loaded from {path}");
+            Some(pc)
+        }
+        None => None,
+    };
+
     match transport {
         "http" => {
             let port = *matches.get_one::<u16>("port").unwrap();
@@ -211,7 +229,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
                 .unwrap()
                 .clone();
             eprintln!("[gws mcp] Starting HTTP transport on {host}:{port}");
-            http_transport::serve(config, &host, port, &allow_origin, oauth_config).await
+            http_transport::serve(config, &host, port, &allow_origin, oauth_config, permissions_config).await
         }
         _ => {
             eprintln!("[gws mcp] Starting stdio transport");
@@ -222,6 +240,14 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
 
 // --- Shared request handler ---
 
+
+/// Permission context for the current request.
+struct PermissionContext<'a> {
+    /// User email (None in local/stdio mode).
+    user_email: Option<&'a str>,
+    /// Permissions config (None if no permissions file loaded).
+    permissions: Option<&'a permissions::PermissionsConfig>,
+}
 
 /// Handle a JSON-RPC MCP request.
 ///
@@ -235,7 +261,7 @@ async fn handle_request(
     config: &ServerConfig,
     tools_cache: &Mutex<Option<Vec<Value>>>,
     access_token: Option<&str>,
-    user_email: Option<&str>,
+    perm_ctx: &PermissionContext<'_>,
 ) -> Result<Value, GwsError> {
     match method {
         "initialize" => Ok(json!({
@@ -257,16 +283,63 @@ async fn handle_request(
             if cache.is_none() {
                 *cache = Some(build_tools_list(config).await?);
             }
+            let all_tools = cache.as_ref().unwrap();
+
+            // Phase 6: Filter tools by user permissions when configured.
+            let tools = filter_tools_by_permissions(all_tools, perm_ctx);
+
             Ok(json!({
-                "tools": cache.as_ref().unwrap()
+                "tools": tools
             }))
         }
-        "tools/call" => handle_tools_call(params, config, access_token, user_email).await,
+        "tools/call" => handle_tools_call(params, config, access_token, perm_ctx).await,
         _ => Err(GwsError::Validation(format!(
             "Method not supported: {}",
             method
         ))),
     }
+}
+
+/// Phase 6: Filter the tools list based on user permissions.
+/// Returns all tools if no permissions are configured.
+/// Returns empty list for unregistered users when permissions are configured.
+fn filter_tools_by_permissions<'a>(
+    tools: &'a [Value],
+    perm_ctx: &PermissionContext<'_>,
+) -> Vec<&'a Value> {
+    let perms = match perm_ctx.permissions {
+        Some(p) => p,
+        None => return tools.iter().collect(), // No permissions → all tools
+    };
+
+    let email = match perm_ctx.user_email {
+        Some(e) => e,
+        None => return tools.iter().collect(), // Local mode → all tools
+    };
+
+    let patterns = match perms.get_allowed_patterns(email) {
+        Some(p) => p,
+        None => return vec![], // Unregistered user → empty list
+    };
+
+    tools
+        .iter()
+        .filter(|tool| {
+            let tool_name = tool
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let method_id = tool_name_to_method_id(tool_name);
+            patterns
+                .iter()
+                .any(|p| permissions::matches_pattern(p, &method_id))
+        })
+        .collect()
+}
+
+/// Convert a tool name like `drive_files_list` to a method ID like `drive.files.list`.
+fn tool_name_to_method_id(tool_name: &str) -> String {
+    tool_name.replace('_', ".")
 }
 
 fn build_jsonrpc_response(id: &Value, result: Result<Value, GwsError>) -> Value {
@@ -308,6 +381,11 @@ mod stdio_transport {
         let mut stdin = BufReader::new(tokio::io::stdin()).lines();
         let mut stdout = tokio::io::stdout();
         let tools_cache = Mutex::new(None);
+        // stdio mode: no permissions (local user has full access).
+        let perm_ctx = PermissionContext {
+            user_email: None,
+            permissions: None,
+        };
 
         while let Ok(Some(line)) = stdin.next_line().await {
             if line.trim().is_empty() {
@@ -320,14 +398,14 @@ mod stdio_transport {
                     if is_notification {
                         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
                         let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-                        let _ = handle_request(method, &params, &config, &tools_cache, None, None).await;
+                        let _ = handle_request(method, &params, &config, &tools_cache, None, &perm_ctx).await;
                         continue;
                     }
 
                     let id = req.get("id").unwrap().clone();
                     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
                     let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-                    let result = handle_request(method, &params, &config, &tools_cache, None, None).await;
+                    let result = handle_request(method, &params, &config, &tools_cache, None, &perm_ctx).await;
                     build_jsonrpc_response(&id, result)
                 }
                 Err(_) => build_parse_error_response(),
@@ -353,6 +431,7 @@ mod stdio_transport {
 
 mod http_transport {
     use super::oauth::{self, OAuthConfig, TokenStore};
+    use super::permissions::PermissionsConfig;
     use super::*;
     use axum::body::Body;
     use axum::extract::{Query, State};
@@ -368,6 +447,7 @@ mod http_transport {
         allowed_origins: Vec<String>,
         oauth_config: Option<OAuthConfig>,
         token_store: Mutex<TokenStore>,
+        permissions: Option<PermissionsConfig>,
     }
 
     pub async fn serve(
@@ -376,6 +456,7 @@ mod http_transport {
         port: u16,
         allow_origin: &str,
         oauth_config: Option<OAuthConfig>,
+        permissions: Option<PermissionsConfig>,
     ) -> Result<(), GwsError> {
         let allowed_origins: Vec<String> = if allow_origin.is_empty() {
             vec![]
@@ -393,6 +474,7 @@ mod http_transport {
             allowed_origins,
             oauth_config,
             token_store: Mutex::new(TokenStore::new()),
+            permissions,
         });
 
         let app = Router::new()
@@ -621,11 +703,15 @@ mod http_transport {
         // Extract bearer token for session binding (empty string when OAuth disabled).
         let bearer_for_binding = extract_bearer_token(&headers).unwrap_or_default();
 
-        // Resolve user email from bearer token for usage-stats logging.
+        // Resolve user email from bearer token for permission checks and logging.
         let user_email = if !bearer_for_binding.is_empty() {
             oauth::get_email_for_bearer(&state.token_store, &bearer_for_binding).await
         } else {
             None
+        };
+        let perm_ctx = PermissionContext {
+            user_email: user_email.as_deref(),
+            permissions: state.permissions.as_ref(),
         };
 
         let mut responses = Vec::new();
@@ -645,7 +731,7 @@ mod http_transport {
                         &state.config,
                         &state.tools_cache,
                         google_token.as_deref(),
-                        user_email.as_deref(),
+                        &perm_ctx,
                     )
                     .await;
                 }
@@ -659,7 +745,7 @@ mod http_transport {
                 &state.config,
                 &state.tools_cache,
                 google_token.as_deref(),
-                user_email.as_deref(),
+                &perm_ctx,
             )
             .await;
             let response = build_jsonrpc_response(&id, result);
@@ -1388,6 +1474,7 @@ mod http_transport {
                 allowed_origins,
                 oauth_config: None,
                 token_store: Mutex::new(TokenStore::new()),
+                permissions: None,
             })
         }
 
@@ -1408,6 +1495,7 @@ mod http_transport {
                     scopes: "openid email".to_string(),
                 }),
                 token_store: Mutex::new(TokenStore::new()),
+                permissions: None,
             })
         }
 
@@ -2550,12 +2638,25 @@ async fn handle_tools_call(
     params: &Value,
     config: &ServerConfig,
     access_token: Option<&str>,
-    user_email: Option<&str>,
+    perm_ctx: &PermissionContext<'_>,
 ) -> Result<Value, GwsError> {
     let tool_name = params
         .get("name")
         .and_then(|n| n.as_str())
         .ok_or_else(|| GwsError::Validation("Missing 'name' in tools/call".to_string()))?;
+
+    // Phase 5: Check permissions before executing the tool.
+    if let Some(perms) = perm_ctx.permissions {
+        if let Some(email) = perm_ctx.user_email {
+            let method_id = tool_name_to_method_id(tool_name);
+            if !perms.is_method_allowed(email, &method_id) {
+                return Err(GwsError::Validation(format!(
+                    "Permission denied: '{}' is not allowed for user '{}'",
+                    method_id, email
+                )));
+            }
+        }
+    }
 
     let default_args = json!({});
     let arguments = params.get("arguments").unwrap_or(&default_args);
@@ -2685,7 +2786,7 @@ async fn handle_tools_call(
     )
     .await;
 
-    let email = user_email.unwrap_or("anonymous");
+    let email = perm_ctx.user_email.unwrap_or("anonymous");
 
     match &result {
         Ok(_) => {
@@ -2726,9 +2827,156 @@ async fn handle_tools_call(
 }
 
 #[cfg(test)]
+mod shared_tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_name_to_method_id() {
+        assert_eq!(tool_name_to_method_id("drive_files_list"), "drive.files.list");
+        assert_eq!(
+            tool_name_to_method_id("gmail_users_messages_send"),
+            "gmail.users.messages.send"
+        );
+        assert_eq!(
+            tool_name_to_method_id("calendar_events_get"),
+            "calendar.events.get"
+        );
+    }
+
+    #[test]
+    fn test_filter_tools_no_permissions() {
+        let tools = vec![
+            json!({"name": "drive_files_list", "description": "List files"}),
+            json!({"name": "gmail_users_messages_send", "description": "Send email"}),
+        ];
+        let perm_ctx = PermissionContext {
+            user_email: None,
+            permissions: None,
+        };
+        let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_tools_unregistered_user() {
+        let tools = vec![
+            json!({"name": "drive_files_list", "description": "List files"}),
+        ];
+        let perms = permissions::PermissionsConfig::parse(
+            "roles:\n  admin:\n    allow:\n      - \"*\"\nusers:\n  admin@co.com:\n    role: admin\n",
+        )
+        .unwrap();
+        let perm_ctx = PermissionContext {
+            user_email: Some("unknown@co.com"),
+            permissions: Some(&perms),
+        };
+        let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_tools_admin_sees_all() {
+        let tools = vec![
+            json!({"name": "drive_files_list", "description": "List files"}),
+            json!({"name": "gmail_users_messages_send", "description": "Send email"}),
+        ];
+        let perms = permissions::PermissionsConfig::parse(
+            "roles:\n  admin:\n    allow:\n      - \"*\"\nusers:\n  admin@co.com:\n    role: admin\n",
+        )
+        .unwrap();
+        let perm_ctx = PermissionContext {
+            user_email: Some("admin@co.com"),
+            permissions: Some(&perms),
+        };
+        let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_tools_reader_sees_subset() {
+        let tools = vec![
+            json!({"name": "drive_files_list", "description": "List files"}),
+            json!({"name": "drive_files_get", "description": "Get file"}),
+            json!({"name": "drive_files_create", "description": "Create file"}),
+            json!({"name": "gmail_users_messages_send", "description": "Send email"}),
+        ];
+        let yaml = r#"
+roles:
+  reader:
+    allow:
+      - "drive.files.list"
+      - "drive.files.get"
+users:
+  reader@co.com:
+    role: reader
+"#;
+        let perms = permissions::PermissionsConfig::parse(yaml).unwrap();
+        let perm_ctx = PermissionContext {
+            user_email: Some("reader@co.com"),
+            permissions: Some(&perms),
+        };
+        let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0]["name"], "drive_files_list");
+        assert_eq!(filtered[1]["name"], "drive_files_get");
+    }
+
+    #[test]
+    fn test_filter_tools_wildcard_service() {
+        let tools = vec![
+            json!({"name": "gmail_users_messages_list", "description": "List"}),
+            json!({"name": "gmail_users_messages_send", "description": "Send"}),
+            json!({"name": "gmail_users_labels_list", "description": "Labels"}),
+            json!({"name": "drive_files_list", "description": "Drive list"}),
+        ];
+        let yaml = r#"
+roles:
+  gmail-user:
+    allow:
+      - "gmail.*"
+users:
+  user@co.com:
+    role: gmail-user
+"#;
+        let perms = permissions::PermissionsConfig::parse(yaml).unwrap();
+        let perm_ctx = PermissionContext {
+            user_email: Some("user@co.com"),
+            permissions: Some(&perms),
+        };
+        let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn test_filter_tools_local_mode_no_email() {
+        let tools = vec![
+            json!({"name": "drive_files_list", "description": "List files"}),
+        ];
+        let perms = permissions::PermissionsConfig::parse(
+            "roles:\n  admin:\n    allow:\n      - \"*\"\nusers:\n  admin@co.com:\n    role: admin\n",
+        )
+        .unwrap();
+        // No user email (local mode) → all tools visible
+        let perm_ctx = PermissionContext {
+            user_email: None,
+            permissions: Some(&perms),
+        };
+        let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
+        assert_eq!(filtered.len(), 1);
+    }
+}
+
+#[cfg(test)]
 mod usage_stats_tests {
     use super::*;
     use tokio::sync::Mutex;
+
+    fn no_perms_ctx(email: Option<&str>) -> PermissionContext<'_> {
+        PermissionContext {
+            user_email: email,
+            permissions: None,
+        }
+    }
 
     #[tokio::test]
     async fn test_handle_request_initialize_with_email() {
@@ -2738,13 +2986,14 @@ mod usage_stats_tests {
             workflows: false,
             _helpers: false,
         };
+        let perm_ctx = no_perms_ctx(Some("user@example.com"));
         let result = handle_request(
             "initialize",
             &json!({}),
             &config,
             &tools_cache,
             None,
-            Some("user@example.com"),
+            &perm_ctx,
         )
         .await;
         assert!(result.is_ok());
@@ -2760,13 +3009,14 @@ mod usage_stats_tests {
             workflows: false,
             _helpers: false,
         };
+        let perm_ctx = no_perms_ctx(None);
         let result = handle_request(
             "initialize",
             &json!({}),
             &config,
             &tools_cache,
             None,
-            None,
+            &perm_ctx,
         )
         .await;
         assert!(result.is_ok());
@@ -2780,6 +3030,7 @@ mod usage_stats_tests {
             workflows: false,
             _helpers: false,
         };
+        let perm_ctx = no_perms_ctx(Some("alice@test.com"));
         // Missing 'name' should return validation error
         let result = handle_request(
             "tools/call",
@@ -2787,7 +3038,7 @@ mod usage_stats_tests {
             &config,
             &tools_cache,
             None,
-            Some("alice@test.com"),
+            &perm_ctx,
         )
         .await;
         assert!(result.is_err());
@@ -2801,13 +3052,14 @@ mod usage_stats_tests {
             workflows: false,
             _helpers: false,
         };
+        let perm_ctx = no_perms_ctx(Some("user@test.com"));
         let result = handle_request(
             "unsupported/method",
             &json!({}),
             &config,
             &tools_cache,
             None,
-            Some("user@test.com"),
+            &perm_ctx,
         )
         .await;
         assert!(result.is_err());

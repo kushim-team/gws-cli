@@ -56,6 +56,7 @@ npm install -g @googleworkspace/cli
 - [Authentication](#authentication)
 - [AI Agent Skills](#ai-agent-skills)
 - [MCP Server](#mcp-server)
+  - [Permission Control](#permission-control-http-gateway)
 - [Advanced Usage](#advanced-usage)
 - [Architecture](#architecture)
 - [Development](#development)
@@ -294,9 +295,80 @@ Configure in your MCP client:
 
 | Flag                    | Description                                  |
 | ----------------------- | -------------------------------------------- |
-| `-s, --services <list>` | Comma-separated services to expose, or `all` |
-| `-w, --workflows`       | Also expose workflow tools                   |
-| `-e, --helpers`         | Also expose helper tools                     |
+| `-s, --services <list>`        | Comma-separated services to expose, or `all`           |
+| `-w, --workflows`              | Also expose workflow tools                             |
+| `-e, --helpers`                | Also expose helper tools                               |
+| `--permissions-file <path>`    | Path to permissions YAML (env: `GWS_PERMISSIONS_FILE`) |
+
+### Permission Control (HTTP Gateway)
+
+When running in HTTP transport mode as a multi-user gateway, you can restrict which API methods each user is allowed to call by providing a YAML permissions file.
+
+```bash
+gws mcp -s all -t http \
+  --oauth-client-id $CLIENT_ID \
+  --gateway-base-url https://gw.example.com \
+  --permissions-file config/permissions.yaml
+```
+
+Or via environment variable:
+
+```bash
+export GWS_PERMISSIONS_FILE=config/permissions.yaml
+```
+
+#### YAML format
+
+```yaml
+# config/permissions.yaml
+
+roles:
+  admin:
+    allow:
+      - "*"                          # all methods
+
+  workspace-reader:
+    allow:
+      - "gmail.users.messages.list"
+      - "gmail.users.messages.get"
+      - "drive.files.list"
+      - "drive.files.get"
+      - "calendar.events.list"
+      - "calendar.events.get"
+
+  gmail-full:
+    allow:
+      - "gmail.*"                    # all Gmail methods
+
+users:
+  admin@company.com:
+    role: admin
+
+  tanaka@company.com:
+    role: workspace-reader
+
+  suzuki@company.com:
+    role: gmail-full
+```
+
+#### Method IDs
+
+Method IDs follow the naming from Google's Discovery JSON (e.g. `drive.files.list`, `gmail.users.messages.send`). You can inspect available method IDs with `gws schema <method_id>`.
+
+#### Wildcard patterns
+
+| Pattern                      | Matches                                           |
+| ---------------------------- | ------------------------------------------------- |
+| `*`                          | All methods across all services                   |
+| `gmail.*`                    | All Gmail methods                                 |
+| `gmail.users.messages.*`     | All Gmail message methods (list, get, send, etc.) |
+| `drive.files.list`           | Exact match only                                  |
+
+#### Behavior
+
+- **Unregistered users** (email not in `users:`) are denied all access — `tools/list` returns an empty list and `tools/call` returns a permission error.
+- **No permissions file** — all authenticated users have full access (backwards-compatible).
+- **stdio / local mode** — permissions are not enforced (local user has full access).
 
 ## Advanced Usage
 
