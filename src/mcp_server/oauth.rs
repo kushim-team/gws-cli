@@ -34,13 +34,40 @@ pub const DEFAULT_OAUTH_SCOPES: &str = "\
     https://www.googleapis.com/auth/chat.messages \
     https://www.googleapis.com/auth/tasks";
 
+/// Maximum number of entries in each HashMap to prevent memory exhaustion.
+const MAX_BEARER_SESSIONS: usize = 100_000;
+const MAX_PENDING_CODES: usize = 10_000;
+const MAX_PENDING_AUTHS: usize = 10_000;
+const MAX_REGISTERED_CLIENTS: usize = 10_000;
+
+/// Bearer token lifetime in seconds (24 hours).
+pub const BEARER_TOKEN_LIFETIME_SECS: i64 = 86400;
+
+/// Authorization code TTL in seconds (10 minutes).
+pub const AUTH_CODE_TTL_SECS: i64 = 600;
+
+/// Pending auth TTL in seconds (15 minutes).
+pub const PENDING_AUTH_TTL_SECS: i64 = 900;
+
 /// OAuth configuration for the MCP Gateway.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OAuthConfig {
     pub client_id: String,
     pub client_secret: String,
     pub base_url: String,
     pub scopes: String,
+}
+
+// Phase 2-13: Redact client_secret in Debug output.
+impl std::fmt::Debug for OAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("scopes", &self.scopes)
+            .finish()
+    }
 }
 
 /// Stored Google OAuth tokens for a user.
@@ -67,6 +94,8 @@ pub struct UserSession {
     #[allow(dead_code)] // Used in Phase 5 (permissions) and Phase 7 (logging)
     pub email: String,
     pub google_tokens: GoogleTokens,
+    /// Unix timestamp when the bearer token expires.
+    pub bearer_expires_at: i64,
 }
 
 /// State tracked between the `/authorize` redirect and the `/oauth/callback`.
@@ -74,16 +103,20 @@ pub struct UserSession {
 pub struct PendingAuth {
     pub client_redirect_uri: String,
     pub client_state: Option<String>,
-    pub code_challenge: Option<String>,
-    pub code_challenge_method: Option<String>,
+    pub code_challenge: String,
+    pub code_challenge_method: String,
+    #[allow(dead_code)] // Used for audit logging and future per-client rate limiting
+    pub client_id: String,
+    pub created_at: i64,
 }
 
 /// State tracked between the `/oauth/callback` and the `POST /token` exchange.
 #[derive(Debug, Clone)]
 pub struct PendingCode {
     pub session: UserSession,
-    pub code_challenge: Option<String>,
-    pub code_challenge_method: Option<String>,
+    pub code_challenge: String,
+    pub code_challenge_method: String,
+    pub created_at: i64,
 }
 
 /// A dynamically registered OAuth client.
@@ -92,6 +125,7 @@ pub struct RegisteredClient {
     pub client_id: String,
     pub redirect_uris: Vec<String>,
     pub client_name: Option<String>,
+    pub client_id_issued_at: i64,
 }
 
 /// In-memory token and session store.
@@ -115,6 +149,76 @@ impl TokenStore {
             registered_clients: HashMap::new(),
         }
     }
+
+    /// Remove expired entries from all maps (lazy cleanup).
+    pub fn cleanup_expired(&mut self) {
+        let now = chrono::Utc::now().timestamp();
+        self.pending_auths
+            .retain(|_, v| now - v.created_at < PENDING_AUTH_TTL_SECS);
+        self.pending_codes
+            .retain(|_, v| now - v.created_at < AUTH_CODE_TTL_SECS);
+        self.bearer_sessions
+            .retain(|_, v| now < v.bearer_expires_at);
+    }
+
+    /// Check if adding to the given map would exceed limits. Returns true if full.
+    pub fn is_bearer_sessions_full(&self) -> bool {
+        self.bearer_sessions.len() >= MAX_BEARER_SESSIONS
+    }
+
+    pub fn is_pending_codes_full(&self) -> bool {
+        self.pending_codes.len() >= MAX_PENDING_CODES
+    }
+
+    pub fn is_pending_auths_full(&self) -> bool {
+        self.pending_auths.len() >= MAX_PENDING_AUTHS
+    }
+
+    pub fn is_registered_clients_full(&self) -> bool {
+        self.registered_clients.len() >= MAX_REGISTERED_CLIENTS
+    }
+}
+
+/// Generate a cryptographically secure random token (256-bit).
+pub fn generate_secure_token() -> String {
+    use rand::RngCore;
+    let mut buf = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    base64_url_encode(&buf)
+}
+
+/// Validate that a redirect URI has a safe scheme.
+pub fn validate_redirect_uri(uri: &str) -> Result<(), String> {
+    let lower = uri.to_lowercase();
+    if lower.starts_with("https://") {
+        return Ok(());
+    }
+    if lower.starts_with("http://localhost")
+        || lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("http://[::1]")
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "Unsafe redirect_uri scheme: {uri}. Only https:// or http://localhost are allowed."
+    ))
+}
+
+/// Validate that a gateway base URL uses HTTPS (except for localhost).
+pub fn validate_gateway_base_url(url: &str) -> Result<(), String> {
+    let lower = url.to_lowercase();
+    if lower.starts_with("https://") {
+        return Ok(());
+    }
+    if lower.starts_with("http://localhost")
+        || lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("http://[::1]")
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "gateway-base-url must use https:// (got: {url}). http:// is only allowed for localhost."
+    ))
 }
 
 /// Exchange a Google authorization code for tokens.
@@ -140,7 +244,9 @@ pub async fn exchange_google_code(
 
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Google token exchange failed: {body}");
+        // Phase 3-5: Limit error log length.
+        let truncated = if body.len() > 500 { &body[..500] } else { &body };
+        anyhow::bail!("Google token exchange failed: {truncated}");
     }
 
     let body: serde_json::Value = resp.json().await?;
@@ -166,7 +272,8 @@ pub async fn refresh_google_token(
 
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Google token refresh failed: {body}");
+        let truncated = if body.len() > 500 { &body[..500] } else { &body };
+        anyhow::bail!("Google token refresh failed: {truncated}");
     }
 
     let body: serde_json::Value = resp.json().await?;
@@ -205,7 +312,8 @@ pub async fn get_google_userinfo(access_token: &str) -> anyhow::Result<String> {
 
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Google userinfo request failed: {body}");
+        let truncated = if body.len() > 500 { &body[..500] } else { &body };
+        anyhow::bail!("Google userinfo request failed: {truncated}");
     }
 
     let body: serde_json::Value = resp.json().await?;
@@ -216,6 +324,7 @@ pub async fn get_google_userinfo(access_token: &str) -> anyhow::Result<String> {
 }
 
 /// Validate a PKCE `code_verifier` against the stored `code_challenge`.
+/// Only S256 is supported; plain is rejected.
 pub fn validate_pkce(
     code_verifier: &str,
     code_challenge: &str,
@@ -227,12 +336,11 @@ pub fn validate_pkce(
             let computed = base64_url_encode(&digest);
             computed == code_challenge
         }
-        "plain" => code_verifier == code_challenge,
         _ => false,
     }
 }
 
-fn base64_url_encode(data: &[u8]) -> String {
+pub fn base64_url_encode(data: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
 }
@@ -243,13 +351,18 @@ pub async fn get_valid_google_token(
     store: &Mutex<TokenStore>,
     bearer_token: &str,
 ) -> anyhow::Result<String> {
-    // Check current token state.
+    // Check bearer token expiry and current Google token state.
     let (needs_refresh, refresh_token_opt) = {
         let guard = store.lock().await;
         let session = guard
             .bearer_sessions
             .get(bearer_token)
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+
+        // Check bearer token expiry.
+        if chrono::Utc::now().timestamp() >= session.bearer_expires_at {
+            anyhow::bail!("Bearer token expired");
+        }
 
         if session.google_tokens.is_expired() {
             (true, session.google_tokens.refresh_token.clone())
@@ -307,7 +420,6 @@ mod tests {
 
     #[test]
     fn test_validate_pkce_s256() {
-        // code_verifier → SHA256 → base64url = code_challenge
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let digest = sha2::Sha256::digest(verifier.as_bytes());
         let challenge = base64_url_encode(&digest);
@@ -326,9 +438,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_pkce_plain() {
-        assert!(validate_pkce("my-code", "my-code", Some("plain")));
-        assert!(!validate_pkce("my-code", "other-code", Some("plain")));
+    fn test_validate_pkce_plain_rejected() {
+        // plain method is no longer accepted — only S256
+        assert!(!validate_pkce("my-code", "my-code", Some("plain")));
     }
 
     #[test]
@@ -358,7 +470,6 @@ mod tests {
 
     #[test]
     fn test_google_tokens_expires_within_buffer() {
-        // Token expires in 30 seconds — within the 60-second buffer
         let tokens = GoogleTokens {
             access_token: "token".to_string(),
             refresh_token: None,
@@ -391,6 +502,7 @@ mod tests {
                     refresh_token: None,
                     expires_at: None,
                 },
+                bearer_expires_at: chrono::Utc::now().timestamp() + 86400,
             },
         );
 
@@ -407,8 +519,10 @@ mod tests {
             PendingAuth {
                 client_redirect_uri: "https://example.com/callback".to_string(),
                 client_state: Some("cs".to_string()),
-                code_challenge: Some("cc".to_string()),
-                code_challenge_method: Some("S256".to_string()),
+                code_challenge: "cc".to_string(),
+                code_challenge_method: "S256".to_string(),
+                client_id: "client1".to_string(),
+                created_at: chrono::Utc::now().timestamp(),
             },
         );
 
@@ -431,9 +545,11 @@ mod tests {
                         refresh_token: Some("rt".to_string()),
                         expires_at: None,
                     },
+                    bearer_expires_at: chrono::Utc::now().timestamp() + 86400,
                 },
-                code_challenge: Some("cc".to_string()),
-                code_challenge_method: Some("S256".to_string()),
+                code_challenge: "cc".to_string(),
+                code_challenge_method: "S256".to_string(),
+                created_at: chrono::Utc::now().timestamp(),
             },
         );
 
@@ -492,9 +608,127 @@ mod tests {
 
     #[test]
     fn test_base64_url_encode() {
-        // Known test vector
         let data = b"hello";
         let encoded = base64_url_encode(data);
-        assert_eq!(encoded, "aGVsbG8"); // base64url("hello") without padding
+        assert_eq!(encoded, "aGVsbG8");
+    }
+
+    #[test]
+    fn test_generate_secure_token_length() {
+        let token = generate_secure_token();
+        // 32 bytes base64url encoded = 43 characters
+        assert_eq!(token.len(), 43);
+    }
+
+    #[test]
+    fn test_generate_secure_token_unique() {
+        let t1 = generate_secure_token();
+        let t2 = generate_secure_token();
+        assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn test_validate_redirect_uri_https() {
+        assert!(validate_redirect_uri("https://example.com/callback").is_ok());
+    }
+
+    #[test]
+    fn test_validate_redirect_uri_localhost() {
+        assert!(validate_redirect_uri("http://localhost:3000/callback").is_ok());
+        assert!(validate_redirect_uri("http://127.0.0.1:8080/cb").is_ok());
+        assert!(validate_redirect_uri("http://[::1]:3000/cb").is_ok());
+    }
+
+    #[test]
+    fn test_validate_redirect_uri_rejects_http() {
+        assert!(validate_redirect_uri("http://example.com/callback").is_err());
+    }
+
+    #[test]
+    fn test_validate_redirect_uri_rejects_dangerous() {
+        assert!(validate_redirect_uri("javascript:alert(1)").is_err());
+        assert!(validate_redirect_uri("data:text/html,<h1>hi</h1>").is_err());
+        assert!(validate_redirect_uri("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_validate_gateway_base_url_https() {
+        assert!(validate_gateway_base_url("https://gw.example.com").is_ok());
+    }
+
+    #[test]
+    fn test_validate_gateway_base_url_localhost() {
+        assert!(validate_gateway_base_url("http://localhost:8080").is_ok());
+    }
+
+    #[test]
+    fn test_validate_gateway_base_url_rejects_http() {
+        assert!(validate_gateway_base_url("http://remote.example.com").is_err());
+    }
+
+    #[test]
+    fn test_cleanup_expired() {
+        let mut store = TokenStore::new();
+        let past = chrono::Utc::now().timestamp() - 10000;
+
+        store.pending_auths.insert(
+            "old".to_string(),
+            PendingAuth {
+                client_redirect_uri: "https://x.com/cb".to_string(),
+                client_state: None,
+                code_challenge: "cc".to_string(),
+                code_challenge_method: "S256".to_string(),
+                client_id: "c".to_string(),
+                created_at: past,
+            },
+        );
+        store.pending_codes.insert(
+            "old_code".to_string(),
+            PendingCode {
+                session: UserSession {
+                    email: "u@e.com".to_string(),
+                    google_tokens: GoogleTokens {
+                        access_token: "at".to_string(),
+                        refresh_token: None,
+                        expires_at: None,
+                    },
+                    bearer_expires_at: past,
+                },
+                code_challenge: "cc".to_string(),
+                code_challenge_method: "S256".to_string(),
+                created_at: past,
+            },
+        );
+        store.bearer_sessions.insert(
+            "old_bearer".to_string(),
+            UserSession {
+                email: "u@e.com".to_string(),
+                google_tokens: GoogleTokens {
+                    access_token: "at".to_string(),
+                    refresh_token: None,
+                    expires_at: None,
+                },
+                bearer_expires_at: past,
+            },
+        );
+
+        store.cleanup_expired();
+
+        assert!(store.pending_auths.is_empty());
+        assert!(store.pending_codes.is_empty());
+        assert!(store.bearer_sessions.is_empty());
+    }
+
+    #[test]
+    fn test_oauth_config_debug_redacts_secret() {
+        let config = OAuthConfig {
+            client_id: "id".to_string(),
+            client_secret: "super-secret-value".to_string(),
+            base_url: "https://gw.example.com".to_string(),
+            scopes: "openid".to_string(),
+        };
+        let debug_output = format!("{:?}", config);
+        assert!(!debug_output.contains("super-secret-value"));
+        assert!(debug_output.contains("[REDACTED]"));
     }
 }

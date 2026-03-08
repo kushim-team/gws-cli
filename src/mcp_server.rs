@@ -93,9 +93,9 @@ fn build_mcp_cli() -> Command {
         )
         .arg(
             Arg::new("oauth-client-secret")
-                .long("oauth-client-secret")
-                .help("Google OAuth client secret for gateway auth (env: GWS_OAUTH_CLIENT_SECRET)")
-                .env("GWS_OAUTH_CLIENT_SECRET"),
+                .help("Google OAuth client secret (env only, not accepted as CLI arg)")
+                .env("GWS_OAUTH_CLIENT_SECRET")
+                .hide(true),
         )
         .arg(
             Arg::new("gateway-base-url")
@@ -158,6 +158,10 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         matches.get_one::<String>("gateway-base-url"),
     ) {
         (Some(client_id), Some(client_secret), Some(base_url)) => {
+            let base_url = base_url.trim_end_matches('/').to_string();
+            oauth::validate_gateway_base_url(&base_url).map_err(|e| {
+                GwsError::Validation(e)
+            })?;
             let scopes = matches
                 .get_one::<String>("oauth-scopes")
                 .unwrap()
@@ -166,7 +170,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
             Some(oauth::OAuthConfig {
                 client_id: client_id.clone(),
                 client_secret: client_secret.clone(),
-                base_url: base_url.trim_end_matches('/').to_string(),
+                base_url,
                 scopes,
             })
         }
@@ -453,6 +457,27 @@ mod http_transport {
     /// If OAuth is configured, requires a valid bearer token and refreshes if needed.
     /// Returns `None` if OAuth is not configured (local mode).
     /// Returns `Err(Response)` with 401 if auth is required but missing/invalid.
+    fn www_authenticate_header(state: &AppState) -> String {
+        let base_url = state
+            .oauth_config
+            .as_ref()
+            .map(|c| c.base_url.as_str())
+            .unwrap_or("");
+        format!(
+            "Bearer realm=\"mcp\", resource_metadata=\"{base_url}/.well-known/oauth-authorization-server\""
+        )
+    }
+
+    fn unauthorized_response(state: &AppState, msg: &str) -> Response {
+        let www_auth = www_authenticate_header(state);
+        (
+            StatusCode::UNAUTHORIZED,
+            [("WWW-Authenticate", www_auth.as_str())],
+            msg.to_string(),
+        )
+            .into_response()
+    }
+
     async fn resolve_google_token(
         headers: &HeaderMap,
         state: &AppState,
@@ -462,21 +487,12 @@ mod http_transport {
             None => return Ok(None), // No OAuth → local mode
         };
 
-        let bearer = extract_bearer_token(headers).ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                [(
-                    "WWW-Authenticate",
-                    "Bearer realm=\"mcp\", resource_metadata=\"/.well-known/oauth-authorization-server\"",
-                )],
-                "Authentication required",
-            )
-                .into_response()
-        })?;
+        let bearer = extract_bearer_token(headers)
+            .ok_or_else(|| unauthorized_response(state, "Authentication required"))?;
 
         match oauth::get_valid_google_token(oauth_config, &state.token_store, &bearer).await {
             Ok(token) => Ok(Some(token)),
-            Err(_) => Err((StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response()),
+            Err(_) => Err(unauthorized_response(state, "Invalid or expired token")),
         }
     }
 
@@ -593,7 +609,7 @@ mod http_transport {
             let response = build_jsonrpc_response(&id, result);
 
             if method == "initialize" {
-                let session_id = uuid::Uuid::new_v4().to_string();
+                let session_id = oauth::generate_secure_token();
                 state.sessions.lock().await.insert(session_id.clone());
                 new_session_id = Some(session_id);
             }
@@ -632,6 +648,10 @@ mod http_transport {
         if !validate_origin(&headers, &state.allowed_origins) {
             return (StatusCode::FORBIDDEN, "Invalid Origin").into_response();
         }
+        // OAuth auth on GET /mcp
+        if let Err(resp) = resolve_google_token(&headers, &state).await {
+            return resp;
+        }
         if let Some(accept) = headers.get("accept").and_then(|v| v.to_str().ok()) {
             if !accept.contains("text/event-stream") && !accept.contains("*/*") {
                 return (
@@ -662,6 +682,10 @@ mod http_transport {
         if !validate_origin(&headers, &state.allowed_origins) {
             return (StatusCode::FORBIDDEN, "Invalid Origin").into_response();
         }
+        // OAuth auth on DELETE /mcp
+        if let Err(resp) = resolve_google_token(&headers, &state).await {
+            return resp;
+        }
         match get_session_id(&headers) {
             Some(ref id) => {
                 let mut sessions = state.sessions.lock().await;
@@ -681,10 +705,13 @@ mod http_transport {
 
     /// GET /.well-known/oauth-authorization-server
     async fn handle_oauth_metadata(State(state): State<Arc<AppState>>) -> Response {
-        let base_url = match &state.oauth_config {
-            Some(c) => &c.base_url,
+        let oauth_config = match &state.oauth_config {
+            Some(c) => c,
             None => return (StatusCode::NOT_FOUND, "OAuth not configured").into_response(),
         };
+        let base_url = &oauth_config.base_url;
+
+        let scopes: Vec<&str> = oauth_config.scopes.split_whitespace().collect();
 
         let metadata = json!({
             "issuer": base_url,
@@ -692,9 +719,10 @@ mod http_transport {
             "token_endpoint": format!("{base_url}/token"),
             "registration_endpoint": format!("{base_url}/register"),
             "response_types_supported": ["code"],
-            "grant_types_supported": ["authorization_code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
             "code_challenge_methods_supported": ["S256"],
-            "token_endpoint_auth_methods_supported": ["none"]
+            "token_endpoint_auth_methods_supported": ["none"],
+            "scopes_supported": scopes
         });
 
         (
@@ -718,22 +746,71 @@ mod http_transport {
             None => return (StatusCode::NOT_FOUND, "OAuth not configured").into_response(),
         };
 
+        // Phase 1-2: client_id is required and must be registered.
+        let client_id = match params.get("client_id") {
+            Some(id) => id.clone(),
+            None => {
+                return oauth_error_response(StatusCode::BAD_REQUEST, "invalid_request", "Missing client_id");
+            }
+        };
+        {
+            let store = state.token_store.lock().await;
+            let client = match store.registered_clients.get(&client_id) {
+                Some(c) => c.clone(),
+                None => {
+                    return oauth_error_response(StatusCode::BAD_REQUEST, "invalid_client", "Unknown client_id");
+                }
+            };
+
+            // Phase 1-2: redirect_uri must be registered.
+            let redirect_uri_param = params.get("redirect_uri");
+            match redirect_uri_param {
+                Some(uri) if !client.redirect_uris.contains(uri) => {
+                    return oauth_error_response(StatusCode::BAD_REQUEST, "invalid_request", "redirect_uri not registered for this client");
+                }
+                None if client.redirect_uris.is_empty() => {
+                    return oauth_error_response(StatusCode::BAD_REQUEST, "invalid_request", "Missing redirect_uri and no default registered");
+                }
+                _ => {}
+            }
+        }
+
         let redirect_uri = match params.get("redirect_uri") {
             Some(u) => u.clone(),
             None => {
-                return (StatusCode::BAD_REQUEST, "Missing redirect_uri").into_response();
+                let store = state.token_store.lock().await;
+                let client = store.registered_clients.get(&client_id).unwrap();
+                client.redirect_uris[0].clone()
             }
         };
 
+        // Phase 1-1: PKCE is required, S256 only.
+        let code_challenge = match params.get("code_challenge") {
+            Some(c) => c.clone(),
+            None => {
+                return oauth_error_response(StatusCode::BAD_REQUEST, "invalid_request", "code_challenge is required (PKCE)");
+            }
+        };
+        let code_challenge_method = params
+            .get("code_challenge_method")
+            .cloned()
+            .unwrap_or_else(|| "S256".to_string());
+        if code_challenge_method != "S256" {
+            return oauth_error_response(StatusCode::BAD_REQUEST, "invalid_request", "Only S256 code_challenge_method is supported");
+        }
+
         let client_state = params.get("state").cloned();
-        let code_challenge = params.get("code_challenge").cloned();
-        let code_challenge_method = params.get("code_challenge_method").cloned();
 
         // Generate our own state for the Google OAuth redirect.
-        let our_state = uuid::Uuid::new_v4().to_string();
+        let our_state = oauth::generate_secure_token();
 
         {
             let mut store = state.token_store.lock().await;
+            // Phase 2-11: cleanup and check capacity.
+            store.cleanup_expired();
+            if store.is_pending_auths_full() {
+                return oauth_error_response(StatusCode::SERVICE_UNAVAILABLE, "server_error", "Too many pending authorizations");
+            }
             store.pending_auths.insert(
                 our_state.clone(),
                 oauth::PendingAuth {
@@ -741,6 +818,8 @@ mod http_transport {
                     client_state,
                     code_challenge,
                     code_challenge_method,
+                    client_id,
+                    created_at: chrono::Utc::now().timestamp(),
                 },
             );
         }
@@ -752,6 +831,18 @@ mod http_transport {
             .header("location", google_url)
             .body(Body::empty())
             .unwrap()
+    }
+
+    fn oauth_error_response(status: StatusCode, error: &str, description: &str) -> Response {
+        (
+            status,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            json!({"error": error, "error_description": description}).to_string(),
+        )
+            .into_response()
     }
 
     /// GET /oauth/callback — Google redirects here after user consent.
@@ -781,14 +872,20 @@ mod http_transport {
             None => return (StatusCode::BAD_REQUEST, "Missing state parameter").into_response(),
         };
 
-        // Look up pending auth.
+        // Look up pending auth and check TTL.
         let pending = {
             let mut store = state.token_store.lock().await;
             store.pending_auths.remove(&our_state)
         };
 
         let pending = match pending {
-            Some(p) => p,
+            Some(p) => {
+                // Phase 2-2: pending_auths TTL check.
+                if chrono::Utc::now().timestamp() - p.created_at > oauth::PENDING_AUTH_TTL_SECS {
+                    return (StatusCode::BAD_REQUEST, "Authorization request expired").into_response();
+                }
+                p
+            }
             None => {
                 return (StatusCode::BAD_REQUEST, "Unknown or expired state").into_response()
             }
@@ -823,26 +920,36 @@ mod http_transport {
         eprintln!("[gws mcp] OAuth callback: authenticated user {email}");
 
         // Generate our auth code for the client.
-        let our_code = uuid::Uuid::new_v4().to_string();
+        let our_code = oauth::generate_secure_token();
         {
             let mut store = state.token_store.lock().await;
+            store.cleanup_expired();
+            if store.is_pending_codes_full() {
+                return (StatusCode::SERVICE_UNAVAILABLE, "Too many pending codes").into_response();
+            }
             store.pending_codes.insert(
                 our_code.clone(),
                 oauth::PendingCode {
                     session: oauth::UserSession {
                         email,
                         google_tokens,
+                        bearer_expires_at: chrono::Utc::now().timestamp() + oauth::BEARER_TOKEN_LIFETIME_SECS,
                     },
                     code_challenge: pending.code_challenge,
                     code_challenge_method: pending.code_challenge_method,
+                    created_at: chrono::Utc::now().timestamp(),
                 },
             );
         }
 
-        // Redirect back to the client with our auth code.
+        // Redirect back to the client with our auth code (url-encoded).
         let mut redirect = pending.client_redirect_uri;
         let sep = if redirect.contains('?') { "&" } else { "?" };
-        redirect.push_str(&format!("{sep}code={our_code}"));
+        let encoded_code = percent_encoding::utf8_percent_encode(
+            &our_code,
+            percent_encoding::NON_ALPHANUMERIC,
+        );
+        redirect.push_str(&format!("{sep}code={encoded_code}"));
         if let Some(cs) = &pending.client_state {
             redirect.push_str(&format!(
                 "&state={}",
@@ -860,46 +967,58 @@ mod http_transport {
             .unwrap()
     }
 
-    /// POST /token — exchange our auth code for a bearer token.
+    /// POST /token — exchange our auth code for a bearer token, or refresh.
     async fn handle_token(
         State(state): State<Arc<AppState>>,
+        headers: HeaderMap,
         body: String,
     ) -> Response {
-        if state.oauth_config.is_none() {
-            return (StatusCode::NOT_FOUND, "OAuth not configured").into_response();
-        }
+        let oauth_config = match &state.oauth_config {
+            Some(c) => c,
+            None => return (StatusCode::NOT_FOUND, "OAuth not configured").into_response(),
+        };
 
-        // Parse form-encoded or JSON body.
+        // CORS headers for /token
+        let cors_headers = build_cors_headers(&headers, &state.allowed_origins);
+
+        // Parse form-encoded body.
         let params: HashMap<String, String> =
             serde_urlencoded::from_str(&body).unwrap_or_default();
 
         let grant_type = params.get("grant_type").map(|s| s.as_str()).unwrap_or("");
 
-        if grant_type != "authorization_code" {
-            return (
-                StatusCode::BAD_REQUEST,
-                [(
+        match grant_type {
+            "authorization_code" => {
+                handle_token_authorization_code(&state, &params, cors_headers).await
+            }
+            "refresh_token" => {
+                handle_token_refresh(&state, oauth_config, &params, cors_headers).await
+            }
+            _ => {
+                let mut resp_headers = cors_headers;
+                resp_headers.insert(
                     axum::http::header::CONTENT_TYPE,
                     HeaderValue::from_static("application/json"),
-                )],
-                json!({"error": "unsupported_grant_type"}).to_string(),
-            )
-                .into_response();
+                );
+                (
+                    StatusCode::BAD_REQUEST,
+                    resp_headers,
+                    json!({"error": "unsupported_grant_type"}).to_string(),
+                )
+                    .into_response()
+            }
         }
+    }
 
+    async fn handle_token_authorization_code(
+        state: &AppState,
+        params: &HashMap<String, String>,
+        cors_headers: HeaderMap,
+    ) -> Response {
         let code = match params.get("code") {
             Some(c) => c.clone(),
             None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    [(
-                        axum::http::header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/json"),
-                    )],
-                    json!({"error": "invalid_request", "error_description": "Missing code"})
-                        .to_string(),
-                )
-                    .into_response();
+                return token_error_response("invalid_request", "Missing code", cors_headers);
             }
         };
 
@@ -910,76 +1029,153 @@ mod http_transport {
         };
 
         let pending_code = match pending_code {
-            Some(pc) => pc,
+            Some(pc) => {
+                // Phase 2-1: auth code TTL check (10 minutes).
+                if chrono::Utc::now().timestamp() - pc.created_at > oauth::AUTH_CODE_TTL_SECS {
+                    return token_error_response("invalid_grant", "Authorization code expired", cors_headers);
+                }
+                pc
+            }
             None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    [(
-                        axum::http::header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/json"),
-                    )],
-                    json!({"error": "invalid_grant"}).to_string(),
-                )
-                    .into_response();
+                return token_error_response("invalid_grant", "Invalid authorization code", cors_headers);
             }
         };
 
-        // PKCE validation.
-        if let Some(ref challenge) = pending_code.code_challenge {
-            let verifier = match params.get("code_verifier") {
-                Some(v) => v,
-                None => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        [(
-                            axum::http::header::CONTENT_TYPE,
-                            HeaderValue::from_static("application/json"),
-                        )],
-                        json!({"error": "invalid_request", "error_description": "Missing code_verifier"})
-                            .to_string(),
-                    )
-                        .into_response();
-                }
-            };
-            if !oauth::validate_pkce(
-                verifier,
-                challenge,
-                pending_code.code_challenge_method.as_deref(),
-            ) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    [(
-                        axum::http::header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/json"),
-                    )],
-                    json!({"error": "invalid_grant", "error_description": "PKCE validation failed"})
-                        .to_string(),
-                )
-                    .into_response();
+        // PKCE validation (always required since code_challenge is mandatory).
+        let verifier = match params.get("code_verifier") {
+            Some(v) => v,
+            None => {
+                return token_error_response("invalid_request", "Missing code_verifier", cors_headers);
             }
+        };
+        if !oauth::validate_pkce(
+            verifier,
+            &pending_code.code_challenge,
+            Some(&pending_code.code_challenge_method),
+        ) {
+            return token_error_response("invalid_grant", "PKCE validation failed", cors_headers);
         }
 
-        // Issue bearer token.
-        let bearer_token = uuid::Uuid::new_v4().to_string();
+        // Issue bearer token with 256-bit entropy.
+        let bearer_token = oauth::generate_secure_token();
+        let expires_in = oauth::BEARER_TOKEN_LIFETIME_SECS;
         {
             let mut store = state.token_store.lock().await;
+            store.cleanup_expired();
+            if store.is_bearer_sessions_full() {
+                return token_error_response("server_error", "Too many active sessions", cors_headers);
+            }
             store
                 .bearer_sessions
                 .insert(bearer_token.clone(), pending_code.session);
         }
 
+        let mut resp_headers = cors_headers;
+        resp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+
         let resp_body = json!({
             "access_token": bearer_token,
-            "token_type": "bearer",
+            "token_type": "Bearer",
+            "expires_in": expires_in,
         });
 
         (
             StatusCode::OK,
-            [(
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            )],
+            resp_headers,
             serde_json::to_string(&resp_body).unwrap(),
+        )
+            .into_response()
+    }
+
+    async fn handle_token_refresh(
+        state: &AppState,
+        oauth_config: &oauth::OAuthConfig,
+        params: &HashMap<String, String>,
+        cors_headers: HeaderMap,
+    ) -> Response {
+        let old_bearer = match params.get("refresh_token") {
+            Some(t) => t.clone(),
+            None => {
+                return token_error_response("invalid_request", "Missing refresh_token", cors_headers);
+            }
+        };
+
+        // Look up the existing session.
+        let session = {
+            let mut store = state.token_store.lock().await;
+            store.bearer_sessions.remove(&old_bearer)
+        };
+
+        let mut session = match session {
+            Some(s) => s,
+            None => {
+                return token_error_response("invalid_grant", "Unknown refresh token", cors_headers);
+            }
+        };
+
+        // Refresh Google token if needed.
+        if session.google_tokens.is_expired() {
+            let rt = match &session.google_tokens.refresh_token {
+                Some(rt) => rt.clone(),
+                None => {
+                    return token_error_response("invalid_grant", "No Google refresh token available", cors_headers);
+                }
+            };
+            match oauth::refresh_google_token(oauth_config, &rt).await {
+                Ok(new_tokens) => session.google_tokens = new_tokens,
+                Err(_) => {
+                    return token_error_response("invalid_grant", "Failed to refresh Google token", cors_headers);
+                }
+            }
+        }
+
+        // Issue new bearer token.
+        let new_bearer = oauth::generate_secure_token();
+        let expires_in = oauth::BEARER_TOKEN_LIFETIME_SECS;
+        session.bearer_expires_at = chrono::Utc::now().timestamp() + expires_in;
+
+        {
+            let mut store = state.token_store.lock().await;
+            store.cleanup_expired();
+            if store.is_bearer_sessions_full() {
+                return token_error_response("server_error", "Too many active sessions", cors_headers);
+            }
+            store.bearer_sessions.insert(new_bearer.clone(), session);
+        }
+
+        let mut resp_headers = cors_headers;
+        resp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+
+        let resp_body = json!({
+            "access_token": new_bearer,
+            "token_type": "Bearer",
+            "expires_in": expires_in,
+        });
+
+        (
+            StatusCode::OK,
+            resp_headers,
+            serde_json::to_string(&resp_body).unwrap(),
+        )
+            .into_response()
+    }
+
+    fn token_error_response(error: &str, description: &str, cors_headers: HeaderMap) -> Response {
+        let mut resp_headers = cors_headers;
+        resp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        (
+            StatusCode::BAD_REQUEST,
+            resp_headers,
+            json!({"error": error, "error_description": description}).to_string(),
         )
             .into_response()
     }
@@ -987,11 +1183,14 @@ mod http_transport {
     /// POST /register — Dynamic Client Registration (RFC 7591).
     async fn handle_register(
         State(state): State<Arc<AppState>>,
+        headers: HeaderMap,
         body: String,
     ) -> Response {
         if state.oauth_config.is_none() {
             return (StatusCode::NOT_FOUND, "OAuth not configured").into_response();
         }
+
+        let cors_headers = build_cors_headers(&headers, &state.allowed_origins);
 
         #[derive(serde::Deserialize)]
         struct RegistrationRequest {
@@ -999,6 +1198,10 @@ mod http_transport {
             client_name: Option<String>,
             #[serde(default)]
             redirect_uris: Vec<String>,
+            #[serde(default)]
+            grant_types: Option<Vec<String>>,
+            #[serde(default)]
+            response_types: Option<Vec<String>>,
         }
 
         let req: RegistrationRequest = match serde_json::from_str(&body) {
@@ -1008,38 +1211,96 @@ mod http_transport {
             }
         };
 
-        let client_id = uuid::Uuid::new_v4().to_string();
+        // Phase 2-3: validate redirect_uri schemes.
+        for uri in &req.redirect_uris {
+            if let Err(e) = oauth::validate_redirect_uri(uri) {
+                let mut resp_headers = cors_headers;
+                resp_headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    resp_headers,
+                    json!({"error": "invalid_redirect_uri", "error_description": e}).to_string(),
+                )
+                    .into_response();
+            }
+        }
+
+        let client_id = oauth::generate_secure_token();
+        let now = chrono::Utc::now().timestamp();
         let client = oauth::RegisteredClient {
             client_id: client_id.clone(),
             redirect_uris: req.redirect_uris.clone(),
             client_name: req.client_name.clone(),
+            client_id_issued_at: now,
         };
 
         {
             let mut store = state.token_store.lock().await;
+            if store.is_registered_clients_full() {
+                return (StatusCode::SERVICE_UNAVAILABLE, "Too many registered clients").into_response();
+            }
             store
                 .registered_clients
                 .insert(client_id.clone(), client);
         }
 
+        let mut resp_headers = cors_headers;
+        resp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+
         let resp_body = json!({
             "client_id": client_id,
             "client_name": req.client_name,
             "redirect_uris": req.redirect_uris,
-            "grant_types": ["authorization_code"],
-            "response_types": ["code"],
-            "token_endpoint_auth_method": "none"
+            "grant_types": req.grant_types.unwrap_or_else(|| vec!["authorization_code".to_string()]),
+            "response_types": req.response_types.unwrap_or_else(|| vec!["code".to_string()]),
+            "token_endpoint_auth_method": "none",
+            "client_id_issued_at": now
         });
 
         (
             StatusCode::CREATED,
-            [(
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            )],
+            resp_headers,
             serde_json::to_string(&resp_body).unwrap(),
         )
             .into_response()
+    }
+
+    /// Build CORS response headers for OAuth endpoints.
+    fn build_cors_headers(req_headers: &HeaderMap, allowed_origins: &[String]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(origin) = req_headers.get("origin").and_then(|v| v.to_str().ok()) {
+            let allowed = if allowed_origins.is_empty() {
+                let lower = origin.to_lowercase();
+                lower.starts_with("http://localhost")
+                    || lower.starts_with("https://localhost")
+                    || lower.starts_with("http://127.0.0.1")
+                    || lower.starts_with("https://127.0.0.1")
+                    || lower.starts_with("http://[::1]")
+                    || lower.starts_with("https://[::1]")
+            } else {
+                allowed_origins.iter().any(|a| a == origin)
+            };
+            if allowed {
+                if let Ok(val) = HeaderValue::from_str(origin) {
+                    headers.insert("access-control-allow-origin", val);
+                }
+                headers.insert(
+                    "access-control-allow-methods",
+                    HeaderValue::from_static("GET, POST, DELETE, OPTIONS"),
+                );
+                headers.insert(
+                    "access-control-allow-headers",
+                    HeaderValue::from_static("Content-Type, Authorization, Mcp-Session-Id, Accept"),
+                );
+            }
+        }
+        headers
     }
 
     // ---- Tests ----
@@ -1523,6 +1784,58 @@ mod http_transport {
 
         // --- OAuth endpoint tests ---
 
+        /// Helper: register a client and return the client_id.
+        async fn register_client(app: &Router, redirect_uris: &[&str]) -> String {
+            let body = json!({
+                "client_name": "TestClient",
+                "redirect_uris": redirect_uris
+            });
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/register")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_string(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+            let result: Value = serde_json::from_slice(&bytes).unwrap();
+            result["client_id"].as_str().unwrap().to_string()
+        }
+
+        fn make_pending_code(challenge: String) -> oauth::PendingCode {
+            oauth::PendingCode {
+                session: oauth::UserSession {
+                    email: "user@test.com".to_string(),
+                    google_tokens: oauth::GoogleTokens {
+                        access_token: "google-at".to_string(),
+                        refresh_token: Some("google-rt".to_string()),
+                        expires_at: Some(chrono::Utc::now().timestamp() + 3600),
+                    },
+                    bearer_expires_at: chrono::Utc::now().timestamp() + 86400,
+                },
+                code_challenge: challenge,
+                code_challenge_method: "S256".to_string(),
+                created_at: chrono::Utc::now().timestamp(),
+            }
+        }
+
+        fn make_bearer_session() -> oauth::UserSession {
+            oauth::UserSession {
+                email: "user@corp.com".to_string(),
+                google_tokens: oauth::GoogleTokens {
+                    access_token: "google-at".to_string(),
+                    refresh_token: None,
+                    expires_at: Some(chrono::Utc::now().timestamp() + 3600),
+                },
+                bearer_expires_at: chrono::Utc::now().timestamp() + 86400,
+            }
+        }
+
         #[tokio::test]
         async fn test_oauth_metadata_returns_endpoints() {
             let state = test_state_with_oauth();
@@ -1541,14 +1854,13 @@ mod http_transport {
             let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
             let meta: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(meta["issuer"], "https://gw.example.com");
-            assert_eq!(
-                meta["authorization_endpoint"],
-                "https://gw.example.com/authorize"
-            );
-            assert_eq!(
-                meta["token_endpoint"],
-                "https://gw.example.com/token"
-            );
+            assert_eq!(meta["authorization_endpoint"], "https://gw.example.com/authorize");
+            assert_eq!(meta["token_endpoint"], "https://gw.example.com/token");
+            // Phase 3-1: scopes_supported
+            assert!(meta["scopes_supported"].is_array());
+            // Phase 2-7: refresh_token in grant_types
+            let grant_types = meta["grant_types_supported"].as_array().unwrap();
+            assert!(grant_types.contains(&json!("refresh_token")));
         }
 
         #[tokio::test]
@@ -1569,14 +1881,93 @@ mod http_transport {
         }
 
         #[tokio::test]
-        async fn test_authorize_redirects_to_google() {
+        async fn test_authorize_requires_client_id() {
             let state = test_state_with_oauth();
             let app = test_app(state);
             let resp = app
                 .oneshot(
                     Request::builder()
                         .method("GET")
-                        .uri("/authorize?redirect_uri=https://client.example.com/cb&state=abc&code_challenge=xyz&code_challenge_method=S256")
+                        .uri("/authorize?redirect_uri=https://x.com/cb&code_challenge=xyz&code_challenge_method=S256")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], "invalid_request");
+        }
+
+        #[tokio::test]
+        async fn test_authorize_requires_pkce() {
+            let state = test_state_with_oauth();
+            let app = test_app(state.clone());
+            let client_id = register_client(&app, &["https://x.com/cb"]).await;
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(&format!("/authorize?client_id={client_id}&redirect_uri=https://x.com/cb"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body["error_description"].as_str().unwrap().contains("code_challenge"));
+        }
+
+        #[tokio::test]
+        async fn test_authorize_rejects_plain_pkce() {
+            let state = test_state_with_oauth();
+            let app = test_app(state.clone());
+            let client_id = register_client(&app, &["https://x.com/cb"]).await;
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(&format!("/authorize?client_id={client_id}&redirect_uri=https://x.com/cb&code_challenge=xyz&code_challenge_method=plain"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn test_authorize_validates_redirect_uri() {
+            let state = test_state_with_oauth();
+            let app = test_app(state.clone());
+            let client_id = register_client(&app, &["https://registered.com/cb"]).await;
+            // Try with unregistered redirect_uri
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(&format!("/authorize?client_id={client_id}&redirect_uri=https://evil.com/cb&code_challenge=xyz&code_challenge_method=S256"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn test_authorize_redirects_to_google() {
+            let state = test_state_with_oauth();
+            let app = test_app(state.clone());
+            let client_id = register_client(&app, &["https://client.example.com/cb"]).await;
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(&format!("/authorize?client_id={client_id}&redirect_uri=https://client.example.com/cb&state=abc&code_challenge=xyz&code_challenge_method=S256"))
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -1586,23 +1977,6 @@ mod http_transport {
             let location = resp.headers().get("location").unwrap().to_str().unwrap();
             assert!(location.starts_with("https://accounts.google.com/o/oauth2/auth"));
             assert!(location.contains("client_id=test-client-id"));
-        }
-
-        #[tokio::test]
-        async fn test_authorize_missing_redirect_uri() {
-            let state = test_state_with_oauth();
-            let app = test_app(state);
-            let resp = app
-                .oneshot(
-                    Request::builder()
-                        .method("GET")
-                        .uri("/authorize?state=abc")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         }
 
         #[tokio::test]
@@ -1636,9 +2010,7 @@ mod http_transport {
                         .method("POST")
                         .uri("/token")
                         .header("content-type", "application/x-www-form-urlencoded")
-                        .body(Body::from(
-                            "grant_type=authorization_code&code=bogus",
-                        ))
+                        .body(Body::from("grant_type=authorization_code&code=bogus&code_verifier=x"))
                         .unwrap(),
                 )
                 .await
@@ -1652,40 +2024,20 @@ mod http_transport {
         #[tokio::test]
         async fn test_token_exchange_with_pkce() {
             let state = test_state_with_oauth();
-            // Pre-seed a pending code with PKCE challenge.
             let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
             let challenge = {
                 use sha2::Digest;
                 let digest = sha2::Sha256::digest(verifier.as_bytes());
-                use base64::Engine;
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+                oauth::base64_url_encode(&digest)
             };
 
             {
                 let mut store = state.token_store.lock().await;
-                store.pending_codes.insert(
-                    "test-code".to_string(),
-                    oauth::PendingCode {
-                        session: oauth::UserSession {
-                            email: "user@test.com".to_string(),
-                            google_tokens: oauth::GoogleTokens {
-                                access_token: "google-at".to_string(),
-                                refresh_token: Some("google-rt".to_string()),
-                                expires_at: Some(
-                                    chrono::Utc::now().timestamp() + 3600,
-                                ),
-                            },
-                        },
-                        code_challenge: Some(challenge),
-                        code_challenge_method: Some("S256".to_string()),
-                    },
-                );
+                store.pending_codes.insert("test-code".to_string(), make_pending_code(challenge));
             }
 
             let app = test_app(state.clone());
-            let body_str = format!(
-                "grant_type=authorization_code&code=test-code&code_verifier={verifier}"
-            );
+            let body_str = format!("grant_type=authorization_code&code=test-code&code_verifier={verifier}");
             let resp = app
                 .oneshot(
                     Request::builder()
@@ -1700,14 +2052,48 @@ mod http_transport {
             assert_eq!(resp.status(), StatusCode::OK);
             let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
             let result: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(result["token_type"], "bearer");
+            // Phase 1-5: token_type is "Bearer" (capital B) and expires_in is present
+            assert_eq!(result["token_type"], "Bearer");
+            assert!(result["expires_in"].as_i64().unwrap() > 0);
             assert!(result["access_token"].as_str().is_some());
 
-            // Verify the bearer token is stored.
             let bearer = result["access_token"].as_str().unwrap();
             let store = state.token_store.lock().await;
             let session = store.bearer_sessions.get(bearer).unwrap();
             assert_eq!(session.email, "user@test.com");
+        }
+
+        #[tokio::test]
+        async fn test_token_exchange_expired_code() {
+            let state = test_state_with_oauth();
+            let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+            let challenge = {
+                use sha2::Digest;
+                let digest = sha2::Sha256::digest(verifier.as_bytes());
+                oauth::base64_url_encode(&digest)
+            };
+            {
+                let mut store = state.token_store.lock().await;
+                let mut pc = make_pending_code(challenge);
+                pc.created_at = chrono::Utc::now().timestamp() - 700; // expired (>600s)
+                store.pending_codes.insert("expired-code".to_string(), pc);
+            }
+            let app = test_app(state);
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/token")
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(format!("grant_type=authorization_code&code=expired-code&code_verifier={verifier}")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], "invalid_grant");
         }
 
         #[tokio::test]
@@ -1717,18 +2103,7 @@ mod http_transport {
                 let mut store = state.token_store.lock().await;
                 store.pending_codes.insert(
                     "code2".to_string(),
-                    oauth::PendingCode {
-                        session: oauth::UserSession {
-                            email: "u@t.com".to_string(),
-                            google_tokens: oauth::GoogleTokens {
-                                access_token: "at".to_string(),
-                                refresh_token: None,
-                                expires_at: None,
-                            },
-                        },
-                        code_challenge: Some("expected-challenge".to_string()),
-                        code_challenge_method: Some("S256".to_string()),
-                    },
+                    make_pending_code("expected-challenge".to_string()),
                 );
             }
             let app = test_app(state);
@@ -1738,9 +2113,7 @@ mod http_transport {
                         .method("POST")
                         .uri("/token")
                         .header("content-type", "application/x-www-form-urlencoded")
-                        .body(Body::from(
-                            "grant_type=authorization_code&code=code2&code_verifier=wrong",
-                        ))
+                        .body(Body::from("grant_type=authorization_code&code=code2&code_verifier=wrong"))
                         .unwrap(),
                 )
                 .await
@@ -1748,10 +2121,7 @@ mod http_transport {
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
             let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
             let body: Value = serde_json::from_slice(&bytes).unwrap();
-            assert!(body["error_description"]
-                .as_str()
-                .unwrap()
-                .contains("PKCE"));
+            assert!(body["error_description"].as_str().unwrap().contains("PKCE"));
         }
 
         #[tokio::test]
@@ -1778,6 +2148,30 @@ mod http_transport {
             let result: Value = serde_json::from_slice(&bytes).unwrap();
             assert!(result["client_id"].as_str().is_some());
             assert_eq!(result["client_name"], "Claude");
+            // Phase 3-2: client_id_issued_at
+            assert!(result["client_id_issued_at"].as_i64().is_some());
+        }
+
+        #[tokio::test]
+        async fn test_register_rejects_dangerous_redirect_uri() {
+            let state = test_state_with_oauth();
+            let app = test_app(state);
+            let body = json!({
+                "client_name": "Evil",
+                "redirect_uris": ["javascript:alert(1)"]
+            });
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/register")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_string(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         }
 
         #[tokio::test]
@@ -1798,27 +2192,20 @@ mod http_transport {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            // Phase 2-6: WWW-Authenticate header present on 401
+            assert!(resp.headers().get("www-authenticate").is_some());
+            // Phase 2-5: absolute URL in resource_metadata
+            let www_auth = resp.headers().get("www-authenticate").unwrap().to_str().unwrap();
+            assert!(www_auth.contains("https://gw.example.com/.well-known/oauth-authorization-server"));
         }
 
         #[tokio::test]
         async fn test_mcp_post_with_valid_bearer_token() {
             let state = test_state_with_oauth();
-            // Pre-seed a bearer session.
             {
                 let mut store = state.token_store.lock().await;
-                store.bearer_sessions.insert(
-                    "valid-bearer".to_string(),
-                    oauth::UserSession {
-                        email: "user@corp.com".to_string(),
-                        google_tokens: oauth::GoogleTokens {
-                            access_token: "google-at".to_string(),
-                            refresh_token: None,
-                            expires_at: Some(chrono::Utc::now().timestamp() + 3600),
-                        },
-                    },
-                );
+                store.bearer_sessions.insert("valid-bearer".to_string(), make_bearer_session());
             }
-
             let app = test_app(state);
             let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
             let resp = app
@@ -1852,6 +2239,42 @@ mod http_transport {
                         .header("accept", ACCEPT_MCP)
                         .header("authorization", "Bearer invalid-token")
                         .body(Body::from(serde_json::to_string(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn test_get_mcp_requires_auth_when_oauth_enabled() {
+            let state = test_state_with_oauth();
+            let app = test_app(state);
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/mcp")
+                        .header("accept", "text/event-stream")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn test_delete_mcp_requires_auth_when_oauth_enabled() {
+            let state = test_state_with_oauth();
+            let app = test_app(state);
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri("/mcp")
+                        .header("mcp-session-id", "some-session")
+                        .body(Body::empty())
                         .unwrap(),
                 )
                 .await

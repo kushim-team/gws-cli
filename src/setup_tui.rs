@@ -405,7 +405,11 @@ fn run_picker_loop(
                 .collect();
 
             let list = List::new(items)
-                .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD))
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .highlight_symbol("▸ ");
 
             frame.render_stateful_widget(list, chunks[1], &mut state.list_state);
@@ -802,7 +806,11 @@ impl SetupWizard {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::DarkGray)),
             )
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD))
+            .highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
             .highlight_symbol("▸ ");
 
         frame.render_stateful_widget(list, area, &mut picker.list_state);
