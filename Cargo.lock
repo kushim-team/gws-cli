@@ -919,6 +919,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "serde_yaml",
  "serial_test",
  "sha2",

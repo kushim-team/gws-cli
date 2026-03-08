@@ -4,8 +4,8 @@
 
 | Phase | タスク | 依存 | ステータス |
 |-------|--------|------|-----------|
-| 1 | 既存 stdio MCP を Streamable HTTP 対応に変更 | - | TODO |
-| 2 | ユーザーごとの OAuth トークン管理 | Phase 1 | TODO |
+| 1 | 既存 stdio MCP を Streamable HTTP 対応に変更 | - | DONE |
+| 2 | ユーザーごとの OAuth トークン管理 | Phase 1 | DONE |
 | 3 | Cloud Run にデプロイ | Phase 2 | TODO |
 | 4 | Claude 管理コンソールで組織コネクタとして登録・動作確認 | Phase 3 | TODO |
 | 5 | 権限制御 (YAML ホワイトリスト) | Phase 2 | TODO |
@@ -16,16 +16,19 @@
 
 ### Phase 1: Streamable HTTP 対応
 
-- [ ] HTTP サーバー追加（既存 `mcp_server.rs` の stdio 実装をベースに）
-- [ ] MCP Streamable HTTP トランスポート実装
-- [ ] ローカルで HTTP モードでの動作確認
+- [x] HTTP サーバー追加（既存 `mcp_server.rs` の stdio 実装をベースに）
+- [x] MCP Streamable HTTP トランスポート実装
+- [x] ローカルで HTTP モードでの動作確認
 
 ### Phase 2: OAuth トークン管理
 
-- [ ] Google OAuth フロー実装（認可エンドポイント、コールバック）
-- [ ] ユーザー識別（Google email）
-- [ ] トークンの暗号化保存
-- [ ] トークンリフレッシュ処理
+- [x] Google OAuth フロー実装（認可エンドポイント、コールバック）
+- [x] ユーザー識別（Google email）
+- [x] トークンのインメモリ保存（暗号化永続ストレージは Phase 3 で対応）
+- [x] トークンリフレッシュ処理
+- [x] OAuth 2.1 PKCE フロー対応
+- [x] Dynamic Client Registration (RFC 7591)
+- [x] MCP エンドポイントの Bearer トークン認証
 
 ### Phase 3: Cloud Run デプロイ
 
