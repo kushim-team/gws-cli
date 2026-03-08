@@ -134,9 +134,29 @@ fn parse_server_config(matches: &clap::ArgMatches) -> ServerConfig {
     config
 }
 
+/// Initialise the `tracing` subscriber for structured JSON logging to stderr.
+///
+/// The subscriber outputs one JSON object per log event with ISO-8601
+/// timestamps, making it directly compatible with Cloud Logging.
+/// The log level defaults to `info` and can be overridden with the
+/// `RUST_LOG` environment variable.
+fn init_usage_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt::fmt()
+        .json()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+}
+
 pub async fn start(args: &[String]) -> Result<(), GwsError> {
     let matches = build_mcp_cli().get_matches_from(args);
     let config = parse_server_config(&matches);
+
+    init_usage_tracing();
 
     if config.services.is_empty() {
         eprintln!("[gws mcp] Warning: No services configured. Zero tools will be exposed.");
@@ -207,12 +227,15 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
 ///
 /// `access_token` is an optional pre-authenticated Google OAuth access token.
 /// When provided (gateway mode), it is used for API calls instead of local credentials.
+///
+/// `user_email` is the authenticated user's email, used for usage-stats logging.
 async fn handle_request(
     method: &str,
     params: &Value,
     config: &ServerConfig,
     tools_cache: &Mutex<Option<Vec<Value>>>,
     access_token: Option<&str>,
+    user_email: Option<&str>,
 ) -> Result<Value, GwsError> {
     match method {
         "initialize" => Ok(json!({
@@ -238,7 +261,7 @@ async fn handle_request(
                 "tools": cache.as_ref().unwrap()
             }))
         }
-        "tools/call" => handle_tools_call(params, config, access_token).await,
+        "tools/call" => handle_tools_call(params, config, access_token, user_email).await,
         _ => Err(GwsError::Validation(format!(
             "Method not supported: {}",
             method
@@ -297,14 +320,14 @@ mod stdio_transport {
                     if is_notification {
                         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
                         let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-                        let _ = handle_request(method, &params, &config, &tools_cache, None).await;
+                        let _ = handle_request(method, &params, &config, &tools_cache, None, None).await;
                         continue;
                     }
 
                     let id = req.get("id").unwrap().clone();
                     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
                     let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-                    let result = handle_request(method, &params, &config, &tools_cache, None).await;
+                    let result = handle_request(method, &params, &config, &tools_cache, None, None).await;
                     build_jsonrpc_response(&id, result)
                 }
                 Err(_) => build_parse_error_response(),
@@ -598,6 +621,13 @@ mod http_transport {
         // Extract bearer token for session binding (empty string when OAuth disabled).
         let bearer_for_binding = extract_bearer_token(&headers).unwrap_or_default();
 
+        // Resolve user email from bearer token for usage-stats logging.
+        let user_email = if !bearer_for_binding.is_empty() {
+            oauth::get_email_for_bearer(&state.token_store, &bearer_for_binding).await
+        } else {
+            None
+        };
+
         let mut responses = Vec::new();
         let mut new_session_id: Option<String> = None;
 
@@ -615,6 +645,7 @@ mod http_transport {
                         &state.config,
                         &state.tools_cache,
                         google_token.as_deref(),
+                        user_email.as_deref(),
                     )
                     .await;
                 }
@@ -628,6 +659,7 @@ mod http_transport {
                 &state.config,
                 &state.tools_cache,
                 google_token.as_deref(),
+                user_email.as_deref(),
             )
             .await;
             let response = build_jsonrpc_response(&id, result);
@@ -2518,6 +2550,7 @@ async fn handle_tools_call(
     params: &Value,
     config: &ServerConfig,
     access_token: Option<&str>,
+    user_email: Option<&str>,
 ) -> Result<Value, GwsError> {
     let tool_name = params
         .get("name")
@@ -2650,7 +2683,31 @@ async fn handle_tools_call(
         &crate::formatter::OutputFormat::default(),
         true, // capture_output = true!
     )
-    .await?;
+    .await;
+
+    let email = user_email.unwrap_or("anonymous");
+
+    match &result {
+        Ok(_) => {
+            tracing::info!(
+                email = email,
+                method_id = tool_name,
+                result = "success",
+                "tool call completed"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                email = email,
+                method_id = tool_name,
+                result = "error",
+                error = %e,
+                "tool call failed"
+            );
+        }
+    }
+
+    let result = result?;
 
     let text_content = match result {
         Some(val) => serde_json::to_string_pretty(&val).unwrap_or_else(|_| "[]".to_string()),
@@ -2666,4 +2723,93 @@ async fn handle_tools_call(
         ],
         "isError": false
     }))
+}
+
+#[cfg(test)]
+mod usage_stats_tests {
+    use super::*;
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn test_handle_request_initialize_with_email() {
+        let tools_cache = Mutex::new(None);
+        let config = ServerConfig {
+            services: vec![],
+            workflows: false,
+            _helpers: false,
+        };
+        let result = handle_request(
+            "initialize",
+            &json!({}),
+            &config,
+            &tools_cache,
+            None,
+            Some("user@example.com"),
+        )
+        .await;
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["serverInfo"]["name"], "gws-mcp");
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_initialize_without_email() {
+        let tools_cache = Mutex::new(None);
+        let config = ServerConfig {
+            services: vec![],
+            workflows: false,
+            _helpers: false,
+        };
+        let result = handle_request(
+            "initialize",
+            &json!({}),
+            &config,
+            &tools_cache,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_tools_call_invalid_name_logs_error() {
+        let tools_cache = Mutex::new(None);
+        let config = ServerConfig {
+            services: vec!["drive".to_string()],
+            workflows: false,
+            _helpers: false,
+        };
+        // Missing 'name' should return validation error
+        let result = handle_request(
+            "tools/call",
+            &json!({}),
+            &config,
+            &tools_cache,
+            None,
+            Some("alice@test.com"),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_unsupported_method() {
+        let tools_cache = Mutex::new(None);
+        let config = ServerConfig {
+            services: vec![],
+            workflows: false,
+            _helpers: false,
+        };
+        let result = handle_request(
+            "unsupported/method",
+            &json!({}),
+            &config,
+            &tools_cache,
+            None,
+            Some("user@test.com"),
+        )
+        .await;
+        assert!(result.is_err());
+    }
 }
