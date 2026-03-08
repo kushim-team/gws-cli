@@ -387,6 +387,21 @@ pub async fn get_valid_google_token(
     unreachable!()
 }
 
+/// Look up the user email associated with a bearer token.
+///
+/// Returns `None` when the bearer token is not found in the store
+/// (e.g. OAuth is disabled or the session has expired).
+pub async fn get_email_for_bearer(
+    store: &Mutex<TokenStore>,
+    bearer_token: &str,
+) -> Option<String> {
+    let guard = store.lock().await;
+    guard
+        .bearer_sessions
+        .get(bearer_token)
+        .map(|s| s.email.clone())
+}
+
 /// Build the Google OAuth authorization URL for the consent screen.
 pub fn build_google_auth_url(config: &OAuthConfig, state: &str) -> String {
     let redirect_uri =
@@ -509,6 +524,35 @@ mod tests {
         let session = store.bearer_sessions.get("tok").unwrap();
         assert_eq!(session.email, "user@example.com");
         assert_eq!(session.google_tokens.access_token, "gat");
+    }
+
+    #[tokio::test]
+    async fn test_get_email_for_bearer_found() {
+        let store = tokio::sync::Mutex::new(TokenStore::new());
+        {
+            let mut guard = store.lock().await;
+            guard.bearer_sessions.insert(
+                "bearer-abc".to_string(),
+                UserSession {
+                    email: "alice@example.com".to_string(),
+                    google_tokens: GoogleTokens {
+                        access_token: "gat".to_string(),
+                        refresh_token: None,
+                        expires_at: None,
+                    },
+                    bearer_expires_at: chrono::Utc::now().timestamp() + 86400,
+                },
+            );
+        }
+        let email = get_email_for_bearer(&store, "bearer-abc").await;
+        assert_eq!(email.as_deref(), Some("alice@example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_get_email_for_bearer_not_found() {
+        let store = tokio::sync::Mutex::new(TokenStore::new());
+        let email = get_email_for_bearer(&store, "nonexistent").await;
+        assert!(email.is_none());
     }
 
     #[test]
