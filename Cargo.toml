@@ -59,6 +59,8 @@ percent-encoding = "2.3.2"
 serde_urlencoded = "0.7"
 axum = "0.8"
 uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 
 # The profile that 'cargo dist' will build with
