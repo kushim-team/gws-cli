@@ -226,6 +226,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
 
     match transport {
         "http" => {
+            // OAuth and permissions are only supported in HTTP transport mode.
             let port = *matches.get_one::<u16>("port").unwrap();
             let host = matches.get_one::<String>("host").unwrap().clone();
             let allow_origin = matches
@@ -236,6 +237,14 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
             http::serve(config, &host, port, &allow_origin, oauth_config, permissions_config).await
         }
         _ => {
+            // OAuth and permissions are not supported in stdio mode (local user
+            // authenticates via local credentials and has full access).
+            if oauth_config.is_some() {
+                eprintln!("[gws mcp] Warning: OAuth options are ignored in stdio mode. Use -t http for OAuth support.");
+            }
+            if permissions_config.is_some() {
+                eprintln!("[gws mcp] Warning: --permissions-file is ignored in stdio mode. Use -t http for permission control.");
+            }
             eprintln!("[gws mcp] Starting stdio transport");
             stdio::serve(config).await
         }

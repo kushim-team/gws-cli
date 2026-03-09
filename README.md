@@ -400,9 +400,9 @@ Method IDs follow the naming from Google's Discovery JSON (e.g. `drive.files.lis
 
 #### Behavior
 
+- **HTTP mode only** — OAuth authentication and permission control are only supported in HTTP transport mode (`-t http`). In stdio mode these options are ignored (a warning is printed).
 - **Unregistered users** (email not in `users:`) are denied all access — `tools/list` returns an empty list and `tools/call` returns a permission error.
 - **No permissions file** — all authenticated users have full access (backwards-compatible).
-- **stdio / local mode** — permissions are not enforced (local user has full access).
 
 ## Advanced Usage
 
