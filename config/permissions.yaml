@@ -1,10 +1,313 @@
 roles:
-  drive-searcher:
+  admin:
     allow:
+      # =============================================
+      # Drive v3 (45/55 — delete/権限変更系を除外)
+      # =============================================
+      - "drive.about.get"
+      - "drive.accessproposals.get"
+      - "drive.accessproposals.list"
+      - "drive.accessproposals.resolve"
+      - "drive.approvals.get"
+      - "drive.approvals.list"
+      - "drive.apps.get"
+      - "drive.apps.list"
+      - "drive.changes.getStartPageToken"
+      - "drive.changes.list"
+      - "drive.changes.watch"
+      - "drive.channels.stop"
+      - "drive.comments.create"
+      - "drive.comments.get"
+      - "drive.comments.list"
+      - "drive.comments.update"
+      # drive.comments.delete          — 除外
+      - "drive.drives.get"
+      - "drive.drives.hide"
+      - "drive.drives.list"
+      - "drive.drives.unhide"
+      - "drive.drives.update"
+      # drive.drives.create            — 除外（共有ドライブ新規作成）
+      # drive.drives.delete            — 除外（共有ドライブ削除）
+      - "drive.files.copy"
+      - "drive.files.create"
+      - "drive.files.download"
+      - "drive.files.export"
+      - "drive.files.generateIds"
+      - "drive.files.get"
+      - "drive.files.list"
+      - "drive.files.listLabels"
+      - "drive.files.modifyLabels"
+      - "drive.files.update"
+      - "drive.files.watch"
+      # drive.files.delete             — 除外（完全削除）
+      # drive.files.emptyTrash         — 除外（ゴミ箱全消去）
+      - "drive.operations.get"
+      - "drive.permissions.get"
+      - "drive.permissions.list"
+      # drive.permissions.create       — 除外（外部共有リスク）
+      # drive.permissions.update       — 除外（オーナー移転）
+      # drive.permissions.delete       — 除外（アクセス権剥奪）
+      - "drive.replies.create"
+      - "drive.replies.get"
+      - "drive.replies.list"
+      - "drive.replies.update"
+      # drive.replies.delete           — 除外
+      - "drive.revisions.get"
+      - "drive.revisions.list"
+      - "drive.revisions.update"
+      # drive.revisions.delete         — 除外（バージョン履歴削除）
+      - "drive.teamdrives.get"
+      - "drive.teamdrives.list"
+      - "drive.teamdrives.update"
+      # drive.teamdrives.create        — 除外（drives.create と同等）
+      # drive.teamdrives.delete        — 除外（drives.delete と同等）
+
+      # =============================================
+      # Gmail v1 (22/76 — send/delete/settings系を除外)
+      # =============================================
+      - "gmail.users.drafts.create"
+      - "gmail.users.drafts.get"
+      - "gmail.users.drafts.list"
+      - "gmail.users.drafts.update"
+      # gmail.users.drafts.send        — 除外（下書き送信）
+      # gmail.users.drafts.delete      — 除外
+      - "gmail.users.getProfile"
+      - "gmail.users.history.list"
+      - "gmail.users.labels.create"
+      - "gmail.users.labels.get"
+      - "gmail.users.labels.list"
+      - "gmail.users.labels.patch"
+      - "gmail.users.labels.update"
+      # gmail.users.labels.delete      — 除外
+      - "gmail.users.messages.attachments.get"
+      - "gmail.users.messages.get"
+      - "gmail.users.messages.import"
+      - "gmail.users.messages.insert"
+      - "gmail.users.messages.list"
+      - "gmail.users.messages.untrash"
+      # gmail.users.messages.send      — 除外（メール送信）
+      # gmail.users.messages.delete    — 除外（完全削除）
+      # gmail.users.messages.batchDelete — 除外（一括完全削除）
+      # gmail.users.messages.trash     — 除外
+      # gmail.users.messages.modify    — 除外
+      # gmail.users.messages.batchModify — 除外
+      - "gmail.users.stop"
+      - "gmail.users.threads.get"
+      - "gmail.users.threads.list"
+      - "gmail.users.threads.untrash"
+      # gmail.users.threads.delete     — 除外（完全削除）
+      # gmail.users.threads.trash      — 除外
+      # gmail.users.threads.modify     — 除外
+      - "gmail.users.watch"
+      # gmail.users.settings.*         — 全除外（転送/フィルター/委任等）
+
+      # =============================================
+      # Calendar v3 (27/37 — delete/clear/acl系を除外)
+      # =============================================
+      - "calendar.calendarList.delete"
+      - "calendar.calendarList.get"
+      - "calendar.calendarList.insert"
+      - "calendar.calendarList.list"
+      - "calendar.calendarList.patch"
+      - "calendar.calendarList.update"
+      - "calendar.calendarList.watch"
+      - "calendar.calendars.get"
+      - "calendar.calendars.insert"
+      - "calendar.calendars.patch"
+      - "calendar.calendars.update"
+      # calendar.calendars.clear       — 除外（全予定一括削除）
+      # calendar.calendars.delete      — 除外（カレンダー削除）
+      - "calendar.channels.stop"
+      - "calendar.colors.get"
+      - "calendar.events.get"
+      - "calendar.events.import"
+      - "calendar.events.insert"
+      - "calendar.events.instances"
+      - "calendar.events.list"
+      - "calendar.events.move"
+      - "calendar.events.patch"
+      - "calendar.events.quickAdd"
+      - "calendar.events.update"
+      - "calendar.events.watch"
+      # calendar.events.delete         — 除外
+      - "calendar.freebusy.query"
+      - "calendar.settings.get"
+      - "calendar.settings.list"
+      - "calendar.settings.watch"
+      # calendar.acl.*                 — 全除外（アクセス制御変更）
+
+      # =============================================
+      # Tasks v1 (14/14 — 全許可)
+      # =============================================
+      - "tasks.tasklists.delete"
+      - "tasks.tasklists.get"
+      - "tasks.tasklists.insert"
+      - "tasks.tasklists.list"
+      - "tasks.tasklists.patch"
+      - "tasks.tasklists.update"
+      - "tasks.tasks.clear"
+      - "tasks.tasks.delete"
+      - "tasks.tasks.get"
+      - "tasks.tasks.insert"
+      - "tasks.tasks.list"
+      - "tasks.tasks.move"
+      - "tasks.tasks.patch"
+      - "tasks.tasks.update"
+
+      # =============================================
+      # Sheets v4 (17/17 — 全許可)
+      # =============================================
+      - "sheets.spreadsheets.batchUpdate"
+      - "sheets.spreadsheets.create"
+      - "sheets.spreadsheets.developerMetadata.get"
+      - "sheets.spreadsheets.developerMetadata.search"
+      - "sheets.spreadsheets.get"
+      - "sheets.spreadsheets.getByDataFilter"
+      - "sheets.spreadsheets.sheets.copyTo"
+      - "sheets.spreadsheets.values.append"
+      - "sheets.spreadsheets.values.batchClear"
+      - "sheets.spreadsheets.values.batchClearByDataFilter"
+      - "sheets.spreadsheets.values.batchGet"
+      - "sheets.spreadsheets.values.batchGetByDataFilter"
+      - "sheets.spreadsheets.values.batchUpdate"
+      - "sheets.spreadsheets.values.batchUpdateByDataFilter"
+      - "sheets.spreadsheets.values.clear"
+      - "sheets.spreadsheets.values.get"
+      - "sheets.spreadsheets.values.update"
+
+      # =============================================
+      # Docs v1 (3/3 — 全許可)
+      # =============================================
+      - "docs.documents.batchUpdate"
+      - "docs.documents.create"
+      - "docs.documents.get"
+
+      # =============================================
+      # Slides v1 (5/5 — 全許可)
+      # =============================================
+      - "slides.presentations.batchUpdate"
+      - "slides.presentations.create"
+      - "slides.presentations.get"
+      - "slides.presentations.pages.get"
+      - "slides.presentations.pages.getThumbnail"
+
+  reader:
+    allow:
+      # Drive — 閲覧のみ
+      - "drive.about.get"
       - "drive.files.list"
       - "drive.files.get"
+      - "drive.files.export"
+      - "drive.files.download"
+      - "drive.files.listLabels"
+      - "drive.permissions.list"
+      - "drive.permissions.get"
+      - "drive.comments.list"
+      - "drive.comments.get"
+      - "drive.replies.list"
+      - "drive.replies.get"
+      - "drive.drives.list"
+      - "drive.drives.get"
+      - "drive.revisions.list"
+      - "drive.revisions.get"
+      - "drive.teamdrives.list"
+      - "drive.teamdrives.get"
+      - "drive.changes.list"
+      - "drive.changes.getStartPageToken"
+      # Gmail — 閲覧のみ
+      - "gmail.users.getProfile"
       - "gmail.users.messages.list"
+      - "gmail.users.messages.get"
+      - "gmail.users.messages.attachments.get"
+      - "gmail.users.labels.list"
+      - "gmail.users.labels.get"
+      - "gmail.users.threads.list"
+      - "gmail.users.threads.get"
+      - "gmail.users.history.list"
+      - "gmail.users.drafts.list"
+      - "gmail.users.drafts.get"
+      # Calendar — 閲覧のみ
+      - "calendar.events.list"
+      - "calendar.events.get"
+      - "calendar.events.instances"
+      - "calendar.calendarList.list"
+      - "calendar.calendarList.get"
+      - "calendar.calendars.get"
+      - "calendar.colors.get"
+      - "calendar.freebusy.query"
+      - "calendar.settings.list"
+      - "calendar.settings.get"
+      # Tasks — 閲覧のみ
+      - "tasks.tasklists.list"
+      - "tasks.tasklists.get"
+      - "tasks.tasks.list"
+      - "tasks.tasks.get"
+      # Sheets — 閲覧のみ
+      - "sheets.spreadsheets.get"
+      - "sheets.spreadsheets.getByDataFilter"
+      - "sheets.spreadsheets.values.get"
+      - "sheets.spreadsheets.values.batchGet"
+      - "sheets.spreadsheets.values.batchGetByDataFilter"
+      - "sheets.spreadsheets.developerMetadata.get"
+      - "sheets.spreadsheets.developerMetadata.search"
+      # Docs — 閲覧のみ
+      - "docs.documents.get"
+      # Slides — 閲覧のみ
+      - "slides.presentations.get"
+      - "slides.presentations.pages.get"
+      - "slides.presentations.pages.getThumbnail"
 
 users:
-  kosuke.ito@hodl1.jp:
-    role: drive-searcher
+  # ── 経営層（取締役）→ admin ──
+  hiroki.tahara@hodl1.jp:       # 田原 弘貴 — 代表取締役CEO
+    role: admin
+  kosuke.ito@hodl1.jp:          # 伊藤 光佑 — 取締役CTO
+    role: admin
+  ryo.tanaka@hodl1.jp:          # 田中 遼 — 取締役CSO
+    role: admin
+  takuya.oshima@hodl1.jp:       # 大島 卓也 — 取締役COO
+    role: admin
+  daisuke.takenaka@hodl1.jp:    # 竹中 大介 — 取締役CFO
+    role: admin
+  takahiro.ishihama@hodl1.jp:   # 石濱 嵩博 — 社外取締役
+    role: admin
+
+  # ── Web3事業部（権限多め）→ admin ──
+  yusuke.egami@hodl1.jp:        # 惠上 裕介 — Web3事業部 部長
+    role: admin
+  keisuke.funatsu@hodl1.jp:     # 船津 圭佑 — Web3事業部 / HODL1 Labs兼任
+    role: admin
+
+  # ── 監査等委員会 → reader ──
+  hisao.araki@hodl1.jp:         # 荒木 久雄 — 監査等委員
+    role: reader
+  osamu.watanabe@hodl1.jp:      # 渡辺 治 — 監査等委員
+    role: reader
+  kensuke.sato@hodl1.jp:        # 佐藤 憲介 — 監査等委員
+    role: reader
+
+  # ── 内部監査 → reader ──
+  hajime.hosaka@hodl1.jp:       # 保坂 哉 — 内部監査担当
+    role: reader
+
+  # ── Web3事業部（一般） → reader ──
+  yosuke.naito@hodl1.jp:        # 内藤 洋介
+    role: reader
+  tomofumi.nakasone@hodl1.jp:   # 中曽根 智文
+    role: reader
+
+  # ── 経営企画部 → reader ──
+  taichi.sano@hodl1.jp:         # 佐野 太一
+    role: reader
+  miki.kitazawa@hodl1.jp:       # 北沢 未来
+    role: reader
+  hodaka.goto@hodl1.jp:         # 後藤 穂高（業務委託）
+    role: reader
+  mihoko.egami@hodl1.jp:        # 惠上 美保子（業務委託）
+    role: reader
+
+  # ── 財務・経理部 → reader ──
+  noriko.kitano@hodl1.jp:       # 北野 記子
+    role: reader
+  junichi.ishigaki@hodl1.jp:    # 石垣 潤一（業務委託）
+    role: reader
