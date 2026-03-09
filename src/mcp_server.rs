@@ -147,8 +147,11 @@ fn parse_server_config(matches: &clap::ArgMatches) -> ServerConfig {
 
 /// Initialise the `tracing` subscriber for structured JSON logging to stderr.
 ///
-/// The subscriber outputs one JSON object per log event with ISO-8601
-/// timestamps, making it directly compatible with Cloud Logging.
+/// The subscriber outputs Cloud Logging compatible JSON with:
+/// - `severity` instead of `level` (Cloud Logging standard field)
+/// - Flat structure (no nested `fields` object)
+/// - ISO-8601 `timestamp`
+///
 /// The log level defaults to `info` and can be overridden with the
 /// `RUST_LOG` environment variable.
 fn init_usage_tracing() {
@@ -156,11 +159,121 @@ fn init_usage_tracing() {
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     fmt::fmt()
-        .json()
+        .event_format(CloudLoggingFormat)
         .with_writer(std::io::stderr)
         .with_env_filter(filter)
-        .with_target(false)
         .init();
+}
+
+/// A custom formatter that outputs Cloud Logging compatible JSON.
+///
+/// Cloud Logging expects `severity` (not `level`) and flat key-value pairs
+/// (not nested under `fields`). This formatter produces output like:
+/// ```json
+/// {"severity":"INFO","timestamp":"2026-03-09T10:30:00.123Z","message":"tool call completed","email":"user@example.com","method_id":"drive_files_list","result":"success"}
+/// ```
+struct CloudLoggingFormat;
+
+impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for CloudLoggingFormat
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        _ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        use tracing::Level;
+
+        let severity = match *event.metadata().level() {
+            Level::ERROR => "ERROR",
+            Level::WARN => "WARNING",
+            Level::INFO => "INFO",
+            Level::DEBUG => "DEBUG",
+            Level::TRACE => "DEBUG",
+        };
+
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+
+        // Collect all fields into a map.
+        let mut fields = serde_json::Map::new();
+        let mut visitor = JsonFieldVisitor(&mut fields);
+        event.record(&mut visitor);
+
+        // Extract `message` from fields (tracing stores it as the first positional arg).
+        let message = fields
+            .remove("message")
+            .and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        // Build the top-level JSON object with flat structure.
+        write!(writer, "{{\"severity\":\"{severity}\",\"timestamp\":\"{timestamp}\",\"message\":")?;
+        serde_json::to_writer(WriterAdapter(&mut writer), &message)
+            .map_err(|_| std::fmt::Error)?;
+
+        for (key, value) in &fields {
+            write!(writer, ",\"{key}\":")?;
+            serde_json::to_writer(WriterAdapter(&mut writer), value)
+                .map_err(|_| std::fmt::Error)?;
+        }
+
+        writeln!(writer, "}}")
+    }
+}
+
+/// Visitor that collects tracing event fields into a `serde_json::Map`.
+struct JsonFieldVisitor<'a>(&'a mut serde_json::Map<String, serde_json::Value>);
+
+impl tracing::field::Visit for JsonFieldVisitor<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0
+            .insert(field.name().to_string(), serde_json::Value::String(value.to_string()));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(
+            field.name().to_string(),
+            serde_json::Value::String(format!("{:?}", value)),
+        );
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0
+            .insert(field.name().to_string(), serde_json::json!(value));
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0
+            .insert(field.name().to_string(), serde_json::json!(value));
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.0
+            .insert(field.name().to_string(), serde_json::json!(value));
+    }
+}
+
+/// Adapter to bridge `std::fmt::Write` (tracing's writer) to `std::io::Write` (serde_json).
+struct WriterAdapter<'a, 'b>(&'a mut tracing_subscriber::fmt::format::Writer<'b>);
+
+impl std::io::Write for WriterAdapter<'_, '_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let s = std::str::from_utf8(buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.0
+            .write_str(s)
+            .map_err(std::io::Error::other)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub async fn start(args: &[String]) -> Result<(), GwsError> {

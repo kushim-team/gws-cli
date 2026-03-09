@@ -1,0 +1,10 @@
+roles:
+  drive-searcher:
+    allow:
+      - "drive.files.list"
+      - "drive.files.get"
+      - "gmail.users.messages.list"
+
+users:
+  kosuke.ito@hodl1.jp:
+    role: drive-searcher
