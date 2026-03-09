@@ -74,7 +74,8 @@ fn build_mcp_cli() -> Command {
             Arg::new("port")
                 .long("port")
                 .short('p')
-                .help("Port for HTTP transport")
+                .help("Port for HTTP transport (env: PORT)")
+                .env("PORT")
                 .default_value("8080")
                 .value_parser(clap::value_parser!(u16)),
         )

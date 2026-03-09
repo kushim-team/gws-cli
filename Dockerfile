@@ -27,5 +27,6 @@ ENV PORT=8080
 EXPOSE 8080
 
 # Start MCP gateway in HTTP mode
+# PORT is set by Cloud Run (default 8080), read via clap env("PORT")
 # OAuth credentials should be provided via env vars or Secret Manager
 ENTRYPOINT ["gws", "mcp", "-t", "http", "--host", "0.0.0.0", "--port", "8080", "-s", "all", "--permissions-file", "/app/config/permissions.yaml"]
