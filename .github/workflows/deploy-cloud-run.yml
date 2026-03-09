@@ -98,7 +98,7 @@ jobs:
             --max-instances=3
             --concurrency=80
             --timeout=300s
-            --no-allow-unauthenticated
+            --allow-unauthenticated
           env_vars: |
             RUST_LOG=info
             GWS_GATEWAY_BASE_URL=${{ steps.service-url.outputs.url }}
@@ -132,11 +132,8 @@ jobs:
 
       - name: Health check
         run: |
-          # Cloud Run requires authentication; use identity token
-          TOKEN=$(gcloud auth print-identity-token)
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
             -X POST "${SERVICE_URL}/mcp" \
-            -H "Authorization: Bearer ${TOKEN}" \
             -H "Content-Type: application/json" \
             -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci-healthcheck","version":"1.0"}}}')
           if [ "$STATUS" -ne 200 ]; then
