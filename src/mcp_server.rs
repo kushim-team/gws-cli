@@ -338,6 +338,30 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         None => None,
     };
 
+    // When permissions define scopes and the user did not explicitly set
+    // --oauth-scopes, narrow the OAuth consent to the union of all role
+    // scopes.  This ensures the gateway token only carries the scopes that
+    // at least one role needs (principle of least privilege).
+    let oauth_config = match (oauth_config, &permissions_config) {
+        (Some(mut oc), Some(pc)) => {
+            let user_explicitly_set = matches.value_source("oauth-scopes")
+                == Some(clap::parser::ValueSource::CommandLine);
+            let union = pc.all_scopes_union();
+            if !user_explicitly_set && !union.is_empty() {
+                let mut scopes = vec!["openid".to_string(), "email".to_string(), "profile".to_string()];
+                for s in union {
+                    if !scopes.contains(&s) {
+                        scopes.push(s);
+                    }
+                }
+                oc.scopes = scopes.join(" ");
+                eprintln!("[gws mcp] OAuth scopes narrowed to permissions union: {}", oc.scopes);
+            }
+            Some(oc)
+        }
+        (oc, _) => oc,
+    };
+
     match transport {
         "http" => {
             // OAuth and permissions are only supported in HTTP transport mode.
@@ -403,8 +427,20 @@ async fn handle_request(
             }
             let all_tools = cache.as_ref().unwrap();
 
-            // Phase 6: Filter tools by user permissions when configured.
-            let tools = filter_tools_by_permissions(all_tools, perm_ctx);
+            // Filter tools by user permissions (scopes + optional allow patterns).
+            let filtered = filter_tools_by_permissions(all_tools, perm_ctx);
+
+            // Strip internal `_scopes` metadata before sending to the client.
+            let tools: Vec<Value> = filtered
+                .into_iter()
+                .map(|t| {
+                    let mut t = t.clone();
+                    if let Some(obj) = t.as_object_mut() {
+                        obj.remove("_scopes");
+                    }
+                    t
+                })
+                .collect();
 
             Ok(json!({
                 "tools": tools
@@ -531,11 +567,19 @@ fn walk_resources(prefix: &str, resources: &HashMap<String, RestResource>, tools
                 }
             });
 
-            tools.push(json!({
+            let mut tool = json!({
                 "name": tool_name,
                 "description": description,
                 "inputSchema": input_schema
-            }));
+            });
+
+            // Attach method scopes as internal metadata for permission filtering.
+            // This field is stripped before sending to the client.
+            if !method.scopes.is_empty() {
+                tool["_scopes"] = json!(method.scopes);
+            }
+
+            tools.push(tool);
         }
 
         // Recurse into sub-resources
@@ -555,19 +599,6 @@ async fn handle_tools_call(
         .get("name")
         .and_then(|n| n.as_str())
         .ok_or_else(|| GwsError::Validation("Missing 'name' in tools/call".to_string()))?;
-
-    // Phase 5: Check permissions before executing the tool.
-    if let Some(perms) = perm_ctx.permissions {
-        if let Some(email) = perm_ctx.user_email {
-            let method_id = tool_name_to_method_id(tool_name);
-            if !perms.is_method_allowed(email, &method_id) {
-                return Err(GwsError::Validation(format!(
-                    "Permission denied: '{}' is not allowed for user '{}'",
-                    method_id, email
-                )));
-            }
-        }
-    }
 
     let default_args = json!({});
     let arguments = params.get("arguments").unwrap_or(&default_args);
@@ -623,6 +654,19 @@ async fn handle_tools_call(
     } else {
         return Err(GwsError::Validation("Resource not found".to_string()));
     };
+
+    // Check permissions (scopes + optional allow patterns) before executing.
+    if let Some(perms) = perm_ctx.permissions {
+        if let Some(email) = perm_ctx.user_email {
+            let method_id = tool_name_to_method_id(tool_name);
+            if !perms.is_method_allowed_with_scopes(email, &method_id, &method.scopes) {
+                return Err(GwsError::Validation(format!(
+                    "Permission denied: '{}' is not allowed for user '{}'",
+                    method_id, email
+                )));
+            }
+        }
+    }
 
     let params_json_val = arguments.get("params");
     let params_str = params_json_val
