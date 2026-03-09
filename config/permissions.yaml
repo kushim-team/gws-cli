@@ -1,6 +1,14 @@
 roles:
   admin:
-    allow:
+    scopes:
+      - "https://www.googleapis.com/auth/drive"
+      - "https://www.googleapis.com/auth/gmail.readonly"
+      - "https://www.googleapis.com/auth/calendar"
+      - "https://www.googleapis.com/auth/spreadsheets"
+      - "https://www.googleapis.com/auth/documents"
+      - "https://www.googleapis.com/auth/presentations"
+      - "https://www.googleapis.com/auth/tasks"
+    method:
       # =============================================
       # Drive v3 (45/55 — delete/権限変更系を除外)
       # =============================================
@@ -63,42 +71,43 @@ roles:
       # drive.teamdrives.delete        — 除外（drives.delete と同等）
 
       # =============================================
-      # Gmail v1 (22/76 — send/delete/settings系を除外)
+      # Gmail v1 (閲覧のみ — gmail.readonly スコープ)
+      # gmail.modify が必要なメソッドは全除外
       # =============================================
-      - "gmail.users.drafts.create"
       - "gmail.users.drafts.get"
       - "gmail.users.drafts.list"
-      - "gmail.users.drafts.update"
-      # gmail.users.drafts.send        — 除外（下書き送信）
-      # gmail.users.drafts.delete      — 除外
+      # gmail.users.drafts.create      — 除外（gmail.modify 必要）
+      # gmail.users.drafts.update      — 除外（gmail.modify 必要）
+      # gmail.users.drafts.send        — 除外（gmail.modify 必要）
+      # gmail.users.drafts.delete      — 除外（gmail.modify 必要）
       - "gmail.users.getProfile"
       - "gmail.users.history.list"
-      - "gmail.users.labels.create"
       - "gmail.users.labels.get"
       - "gmail.users.labels.list"
-      - "gmail.users.labels.patch"
-      - "gmail.users.labels.update"
-      # gmail.users.labels.delete      — 除外
+      # gmail.users.labels.create      — 除外（gmail.modify 必要）
+      # gmail.users.labels.patch       — 除外（gmail.modify 必要）
+      # gmail.users.labels.update      — 除外（gmail.modify 必要）
+      # gmail.users.labels.delete      — 除外（gmail.modify 必要）
       - "gmail.users.messages.attachments.get"
       - "gmail.users.messages.get"
-      - "gmail.users.messages.import"
-      - "gmail.users.messages.insert"
       - "gmail.users.messages.list"
-      - "gmail.users.messages.untrash"
-      # gmail.users.messages.send      — 除外（メール送信）
-      # gmail.users.messages.delete    — 除外（完全削除）
-      # gmail.users.messages.batchDelete — 除外（一括完全削除）
-      # gmail.users.messages.trash     — 除外
-      # gmail.users.messages.modify    — 除外
-      # gmail.users.messages.batchModify — 除外
-      - "gmail.users.stop"
+      # gmail.users.messages.import    — 除外（gmail.modify 必要）
+      # gmail.users.messages.insert    — 除外（gmail.modify 必要）
+      # gmail.users.messages.untrash   — 除外（gmail.modify 必要）
+      # gmail.users.messages.send      — 除外（gmail.modify 必要）
+      # gmail.users.messages.delete    — 除外（gmail.modify 必要）
+      # gmail.users.messages.batchDelete — 除外（gmail.modify 必要）
+      # gmail.users.messages.trash     — 除外（gmail.modify 必要）
+      # gmail.users.messages.modify    — 除外（gmail.modify 必要）
+      # gmail.users.messages.batchModify — 除外（gmail.modify 必要）
       - "gmail.users.threads.get"
       - "gmail.users.threads.list"
-      - "gmail.users.threads.untrash"
-      # gmail.users.threads.delete     — 除外（完全削除）
-      # gmail.users.threads.trash      — 除外
-      # gmail.users.threads.modify     — 除外
-      - "gmail.users.watch"
+      # gmail.users.threads.untrash    — 除外（gmail.modify 必要）
+      # gmail.users.threads.delete     — 除外（gmail.modify 必要）
+      # gmail.users.threads.trash      — 除外（gmail.modify 必要）
+      # gmail.users.threads.modify     — 除外（gmail.modify 必要）
+      # gmail.users.stop               — 除外（gmail.modify 必要）
+      # gmail.users.watch              — 除外（gmail.modify 必要）
       # gmail.users.settings.*         — 全除外（転送/フィルター/委任等）
 
       # =============================================
@@ -192,7 +201,15 @@ roles:
       - "slides.presentations.pages.getThumbnail"
 
   reader:
-    allow:
+    scopes:
+      - "https://www.googleapis.com/auth/drive.readonly"
+      - "https://www.googleapis.com/auth/gmail.readonly"
+      - "https://www.googleapis.com/auth/calendar.readonly"
+      - "https://www.googleapis.com/auth/spreadsheets.readonly"
+      - "https://www.googleapis.com/auth/documents.readonly"
+      - "https://www.googleapis.com/auth/presentations.readonly"
+      - "https://www.googleapis.com/auth/tasks.readonly"
+    method:
       # Drive — 閲覧のみ
       - "drive.about.get"
       - "drive.files.list"

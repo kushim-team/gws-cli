@@ -16,11 +16,26 @@ pub struct PermissionsConfig {
     pub users: HashMap<String, UserDef>,
 }
 
-/// A role definition containing allowed method ID patterns.
+/// A role definition containing allowed OAuth scopes and method ID patterns.
+///
+/// `scopes` is the primary access control layer — it determines which OAuth
+/// scopes the role is allowed to use.  At tool-execution time the method's
+/// required scopes (from the Discovery Document) are checked against the
+/// role's scopes; the request is allowed only when at least one of the
+/// method's scopes is present in the role.
+///
+/// `method` specifies which API method IDs (with optional wildcards) the role
+/// is allowed to call.
+///
+/// Both `scopes` and `method` are always checked.  A request is allowed only
+/// when it passes **both** the scope check and the method-pattern check.
+/// If either list is empty the corresponding check fails (deny-by-default).
 #[derive(Debug, Deserialize, Clone)]
 pub struct RoleDef {
     #[serde(default)]
-    pub allow: Vec<String>,
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub method: Vec<String>,
 }
 
 /// A user definition referencing a role name.
@@ -61,19 +76,86 @@ impl PermissionsConfig {
 
     /// Get the allowed method patterns for a user.
     /// Returns `None` if the user is not registered (unregistered users get nothing).
+    #[cfg(test)]
     pub fn get_allowed_patterns(&self, email: &str) -> Option<&[String]> {
         let user_def = self.users.get(email)?;
         let role_def = self.roles.get(&user_def.role)?;
-        Some(&role_def.allow)
+        Some(&role_def.method)
     }
 
-    /// Check if a specific method ID is allowed for the given user.
+    /// Get the allowed OAuth scopes for a user.
+    /// Returns `None` if the user is not registered.
+    #[cfg(test)]
+    pub fn get_allowed_scopes(&self, email: &str) -> Option<&[String]> {
+        let user_def = self.users.get(email)?;
+        let role_def = self.roles.get(&user_def.role)?;
+        Some(&role_def.scopes)
+    }
+
+    /// Check if a method is allowed for the given user based on both scope
+    /// and (optionally) method-pattern checks.
+    ///
+    /// Convenience wrapper over [`is_method_allowed_with_scopes`] with an
+    /// empty method-scope list (scope check is skipped).
+    ///
     /// Returns `false` for unregistered users.
+    #[cfg(test)]
     pub fn is_method_allowed(&self, email: &str, method_id: &str) -> bool {
-        match self.get_allowed_patterns(email) {
-            Some(patterns) => patterns.iter().any(|p| matches_pattern(p, method_id)),
-            None => false,
+        self.is_method_allowed_with_scopes(email, method_id, &[])
+    }
+
+    /// Like [`is_method_allowed`] but also checks the method's required
+    /// OAuth scopes against the role's allowed scopes.
+    pub fn is_method_allowed_with_scopes(
+        &self,
+        email: &str,
+        method_id: &str,
+        method_scopes: &[String],
+    ) -> bool {
+        let user_def = match self.users.get(email) {
+            Some(u) => u,
+            None => return false,
+        };
+        let role_def = match self.roles.get(&user_def.role) {
+            Some(r) => r,
+            None => return false,
+        };
+
+        // Scope check: role must have scopes and at least one must match.
+        if role_def.scopes.is_empty() {
+            return false;
         }
+        if !method_scopes.is_empty() {
+            let scope_ok = method_scopes
+                .iter()
+                .any(|ms| role_def.scopes.iter().any(|rs| rs == ms));
+            if !scope_ok {
+                return false;
+            }
+        }
+
+        // Method-pattern check: role must have patterns and method must match.
+        if role_def.method.is_empty() {
+            return false;
+        }
+        role_def.method.iter().any(|p| matches_pattern(p, method_id))
+    }
+
+    /// Return the union of all scopes across every role.
+    ///
+    /// This is used to compute the minimal OAuth scope set for the gateway's
+    /// Google OAuth consent screen when permissions are configured.
+    pub fn all_scopes_union(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for role_def in self.roles.values() {
+            for scope in &role_def.scopes {
+                if seen.insert(scope.clone()) {
+                    result.push(scope.clone());
+                }
+            }
+        }
+        result
     }
 
     /// Filter a list of method IDs to only those allowed for the given user.
@@ -123,9 +205,13 @@ pub(super) struct PermissionContext<'a> {
     pub permissions: Option<&'a PermissionsConfig>,
 }
 
-/// Phase 6: Filter the tools list based on user permissions.
+/// Filter the tools list based on user permissions (scopes + method patterns).
 /// Returns all tools if no permissions are configured.
 /// Returns empty list for unregistered users when permissions are configured.
+///
+/// Each tool's JSON value may contain a `_scopes` array (internal metadata,
+/// stripped before sending to the client) that lists the OAuth scopes the
+/// underlying API method requires.
 pub(super) fn filter_tools_by_permissions<'a>(
     tools: &'a [Value],
     perm_ctx: &PermissionContext<'_>,
@@ -140,10 +226,19 @@ pub(super) fn filter_tools_by_permissions<'a>(
         None => return tools.iter().collect(), // Local mode -> all tools
     };
 
-    let patterns = match perms.get_allowed_patterns(email) {
-        Some(p) => p,
+    let user_def = match perms.users.get(email) {
+        Some(u) => u,
         None => return vec![], // Unregistered user -> empty list
     };
+    let role_def = match perms.roles.get(&user_def.role) {
+        Some(r) => r,
+        None => return vec![], // Missing role -> empty list
+    };
+
+    // Both scopes and method must be defined on the role.
+    if role_def.scopes.is_empty() || role_def.method.is_empty() {
+        return vec![];
+    }
 
     tools
         .iter()
@@ -153,9 +248,29 @@ pub(super) fn filter_tools_by_permissions<'a>(
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
             let method_id = tool_name_to_method_id(tool_name);
-            patterns
-                .iter()
-                .any(|p| matches_pattern(p, &method_id))
+
+            // Scope check.
+            let method_scopes: Vec<String> = tool
+                .get("_scopes")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if !method_scopes.is_empty() {
+                let scope_ok = method_scopes
+                    .iter()
+                    .any(|ms| role_def.scopes.iter().any(|rs| rs == ms));
+                if !scope_ok {
+                    return false;
+                }
+            }
+
+            // Method-pattern check.
+            role_def.method.iter().any(|p| matches_pattern(p, &method_id))
         })
         .collect()
 }
@@ -217,10 +332,10 @@ mod tests {
         let yaml = r#"
 roles:
   admin:
-    allow:
+    method:
       - "*"
   reader:
-    allow:
+    method:
       - "drive.files.list"
       - "drive.files.get"
 
@@ -240,7 +355,7 @@ users:
         let yaml = r#"
 roles:
   admin:
-    allow:
+    method:
       - "*"
 
 users:
@@ -256,7 +371,10 @@ users:
         let yaml = r#"
 roles:
   admin:
-    allow:
+    scopes:
+      - "https://www.googleapis.com/auth/drive"
+      - "https://www.googleapis.com/auth/gmail.modify"
+    method:
       - "*"
 
 users:
@@ -273,7 +391,9 @@ users:
         let yaml = r#"
 roles:
   reader:
-    allow:
+    scopes:
+      - "https://www.googleapis.com/auth/drive.readonly"
+    method:
       - "drive.files.list"
       - "drive.files.get"
 
@@ -292,7 +412,9 @@ users:
         let yaml = r#"
 roles:
   admin:
-    allow:
+    scopes:
+      - "https://www.googleapis.com/auth/drive"
+    method:
       - "*"
 
 users:
@@ -308,7 +430,7 @@ users:
         let yaml = r#"
 roles:
   reader:
-    allow:
+    method:
       - "drive.files.*"
 
 users:
@@ -334,7 +456,7 @@ users:
         let yaml = r#"
 roles:
   admin:
-    allow:
+    method:
       - "*"
 
 users:
@@ -392,7 +514,7 @@ users: {}
             json!({"name": "drive_files_list", "description": "List files"}),
         ];
         let perms = PermissionsConfig::parse(
-            "roles:\n  admin:\n    allow:\n      - \"*\"\nusers:\n  admin@co.com:\n    role: admin\n",
+            "roles:\n  admin:\n    scopes:\n      - \"https://www.googleapis.com/auth/drive\"\n    method:\n      - \"*\"\nusers:\n  admin@co.com:\n    role: admin\n",
         )
         .unwrap();
         let perm_ctx = PermissionContext {
@@ -411,7 +533,7 @@ users: {}
             json!({"name": "gmail_users_messages_send", "description": "Send email"}),
         ];
         let perms = PermissionsConfig::parse(
-            "roles:\n  admin:\n    allow:\n      - \"*\"\nusers:\n  admin@co.com:\n    role: admin\n",
+            "roles:\n  admin:\n    scopes:\n      - \"https://www.googleapis.com/auth/drive\"\n    method:\n      - \"*\"\nusers:\n  admin@co.com:\n    role: admin\n",
         )
         .unwrap();
         let perm_ctx = PermissionContext {
@@ -434,7 +556,9 @@ users: {}
         let yaml = r#"
 roles:
   reader:
-    allow:
+    scopes:
+      - "https://www.googleapis.com/auth/drive.readonly"
+    method:
       - "drive.files.list"
       - "drive.files.get"
 users:
@@ -464,7 +588,9 @@ users:
         let yaml = r#"
 roles:
   gmail-user:
-    allow:
+    scopes:
+      - "https://www.googleapis.com/auth/gmail.modify"
+    method:
       - "gmail.*"
 users:
   user@co.com:
@@ -486,7 +612,7 @@ users:
             json!({"name": "drive_files_list", "description": "List files"}),
         ];
         let perms = PermissionsConfig::parse(
-            "roles:\n  admin:\n    allow:\n      - \"*\"\nusers:\n  admin@co.com:\n    role: admin\n",
+            "roles:\n  admin:\n    scopes:\n      - \"https://www.googleapis.com/auth/drive\"\n    method:\n      - \"*\"\nusers:\n  admin@co.com:\n    role: admin\n",
         )
         .unwrap();
         // No user email (local mode) -> all tools visible
@@ -496,5 +622,309 @@ users:
         };
         let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
         assert_eq!(filtered.len(), 1);
+    }
+
+    // ── Scope-based permission tests ──
+
+    #[test]
+    fn test_parse_yaml_with_scopes() {
+        let yaml = r#"
+roles:
+  editor:
+    scopes:
+      - "https://www.googleapis.com/auth/drive"
+      - "https://www.googleapis.com/auth/gmail.modify"
+    method:
+      - "drive.*"
+  viewer:
+    scopes:
+      - "https://www.googleapis.com/auth/drive.readonly"
+
+users:
+  editor@co.com:
+    role: editor
+  viewer@co.com:
+    role: viewer
+"#;
+        let config = PermissionsConfig::parse(yaml).unwrap();
+        assert_eq!(config.roles["editor"].scopes.len(), 2);
+        assert_eq!(config.roles["viewer"].scopes.len(), 1);
+        assert!(config.roles["viewer"].method.is_empty());
+    }
+
+    #[test]
+    fn test_get_allowed_scopes() {
+        let yaml = r#"
+roles:
+  viewer:
+    scopes:
+      - "https://www.googleapis.com/auth/drive.readonly"
+users:
+  viewer@co.com:
+    role: viewer
+"#;
+        let config = PermissionsConfig::parse(yaml).unwrap();
+        let scopes = config.get_allowed_scopes("viewer@co.com").unwrap();
+        assert_eq!(scopes, &["https://www.googleapis.com/auth/drive.readonly"]);
+        assert!(config.get_allowed_scopes("unknown@co.com").is_none());
+    }
+
+    #[test]
+    fn test_is_method_allowed_with_scopes_matching() {
+        let yaml = r#"
+roles:
+  editor:
+    scopes:
+      - "https://www.googleapis.com/auth/drive"
+    method:
+      - "drive.*"
+users:
+  user@co.com:
+    role: editor
+"#;
+        let config = PermissionsConfig::parse(yaml).unwrap();
+        // Method requires drive scope — allowed
+        assert!(config.is_method_allowed_with_scopes(
+            "user@co.com",
+            "drive.files.list",
+            &["https://www.googleapis.com/auth/drive".to_string(),
+              "https://www.googleapis.com/auth/drive.readonly".to_string()],
+        ));
+    }
+
+    #[test]
+    fn test_is_method_allowed_with_scopes_denied() {
+        let yaml = r#"
+roles:
+  viewer:
+    scopes:
+      - "https://www.googleapis.com/auth/drive.readonly"
+    method:
+      - "drive.*"
+users:
+  user@co.com:
+    role: viewer
+"#;
+        let config = PermissionsConfig::parse(yaml).unwrap();
+        // Method requires gmail scope — denied (user only has drive.readonly)
+        assert!(!config.is_method_allowed_with_scopes(
+            "user@co.com",
+            "gmail.users.messages.list",
+            &["https://www.googleapis.com/auth/gmail.modify".to_string()],
+        ));
+    }
+
+    #[test]
+    fn test_is_method_allowed_with_scopes_plus_method_pattern() {
+        let yaml = r#"
+roles:
+  restricted:
+    scopes:
+      - "https://www.googleapis.com/auth/drive"
+    method:
+      - "drive.files.list"
+      - "drive.files.get"
+users:
+  user@co.com:
+    role: restricted
+"#;
+        let config = PermissionsConfig::parse(yaml).unwrap();
+        let drive_scopes = vec!["https://www.googleapis.com/auth/drive".to_string()];
+        // Scope matches AND method matches → allowed
+        assert!(config.is_method_allowed_with_scopes(
+            "user@co.com", "drive.files.list", &drive_scopes,
+        ));
+        // Scope matches BUT method doesn't match → denied
+        assert!(!config.is_method_allowed_with_scopes(
+            "user@co.com", "drive.files.create", &drive_scopes,
+        ));
+    }
+
+    #[test]
+    fn test_empty_scopes_denies_all() {
+        let yaml = r#"
+roles:
+  no-scopes:
+    method:
+      - "drive.files.*"
+users:
+  user@co.com:
+    role: no-scopes
+"#;
+        let config = PermissionsConfig::parse(yaml).unwrap();
+        // No scopes defined → always denied
+        assert!(!config.is_method_allowed_with_scopes(
+            "user@co.com",
+            "drive.files.list",
+            &["https://www.googleapis.com/auth/drive".to_string()],
+        ));
+    }
+
+    #[test]
+    fn test_empty_method_denies_all() {
+        let yaml = r#"
+roles:
+  no-method:
+    scopes:
+      - "https://www.googleapis.com/auth/drive"
+users:
+  user@co.com:
+    role: no-method
+"#;
+        let config = PermissionsConfig::parse(yaml).unwrap();
+        // No method patterns defined → always denied
+        assert!(!config.is_method_allowed_with_scopes(
+            "user@co.com",
+            "drive.files.list",
+            &["https://www.googleapis.com/auth/drive".to_string()],
+        ));
+    }
+
+    #[test]
+    fn test_all_scopes_union() {
+        let yaml = r#"
+roles:
+  editor:
+    scopes:
+      - "https://www.googleapis.com/auth/drive"
+      - "https://www.googleapis.com/auth/gmail.modify"
+  viewer:
+    scopes:
+      - "https://www.googleapis.com/auth/drive.readonly"
+      - "https://www.googleapis.com/auth/drive"
+users:
+  e@co.com:
+    role: editor
+  v@co.com:
+    role: viewer
+"#;
+        let config = PermissionsConfig::parse(yaml).unwrap();
+        let union = config.all_scopes_union();
+        // drive appears in both roles but should be deduplicated
+        assert!(union.contains(&"https://www.googleapis.com/auth/drive".to_string()));
+        assert!(union.contains(&"https://www.googleapis.com/auth/gmail.modify".to_string()));
+        assert!(union.contains(&"https://www.googleapis.com/auth/drive.readonly".to_string()));
+        assert_eq!(union.len(), 3);
+    }
+
+    #[test]
+    fn test_all_scopes_union_empty() {
+        let yaml = r#"
+roles:
+  legacy:
+    method:
+      - "*"
+users:
+  user@co.com:
+    role: legacy
+"#;
+        let config = PermissionsConfig::parse(yaml).unwrap();
+        assert!(config.all_scopes_union().is_empty());
+    }
+
+    #[test]
+    fn test_filter_tools_by_scopes_and_method() {
+        use serde_json::json;
+        let tools = vec![
+            json!({
+                "name": "drive_files_list",
+                "description": "List files",
+                "_scopes": ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/drive.readonly"]
+            }),
+            json!({
+                "name": "gmail_users_messages_list",
+                "description": "List messages",
+                "_scopes": ["https://www.googleapis.com/auth/gmail.modify", "https://www.googleapis.com/auth/gmail.readonly"]
+            }),
+        ];
+        let yaml = r#"
+roles:
+  drive-only:
+    scopes:
+      - "https://www.googleapis.com/auth/drive.readonly"
+    method:
+      - "drive.*"
+users:
+  user@co.com:
+    role: drive-only
+"#;
+        let perms = PermissionsConfig::parse(yaml).unwrap();
+        let perm_ctx = PermissionContext {
+            user_email: Some("user@co.com"),
+            permissions: Some(&perms),
+        };
+        let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["name"], "drive_files_list");
+    }
+
+    #[test]
+    fn test_filter_tools_scopes_plus_method() {
+        use serde_json::json;
+        let tools = vec![
+            json!({
+                "name": "drive_files_list",
+                "description": "List files",
+                "_scopes": ["https://www.googleapis.com/auth/drive"]
+            }),
+            json!({
+                "name": "drive_files_create",
+                "description": "Create file",
+                "_scopes": ["https://www.googleapis.com/auth/drive"]
+            }),
+            json!({
+                "name": "gmail_users_messages_list",
+                "description": "List messages",
+                "_scopes": ["https://www.googleapis.com/auth/gmail.modify"]
+            }),
+        ];
+        let yaml = r#"
+roles:
+  restricted:
+    scopes:
+      - "https://www.googleapis.com/auth/drive"
+    method:
+      - "drive.files.list"
+users:
+  user@co.com:
+    role: restricted
+"#;
+        let perms = PermissionsConfig::parse(yaml).unwrap();
+        let perm_ctx = PermissionContext {
+            user_email: Some("user@co.com"),
+            permissions: Some(&perms),
+        };
+        let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
+        // Only drive_files_list: scope matches AND method matches
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["name"], "drive_files_list");
+    }
+
+    #[test]
+    fn test_both_scopes_and_method_required() {
+        let yaml = r#"
+roles:
+  scopes-only:
+    scopes:
+      - "https://www.googleapis.com/auth/drive"
+  method-only:
+    method:
+      - "drive.*"
+users:
+  s@co.com:
+    role: scopes-only
+  m@co.com:
+    role: method-only
+"#;
+        let config = PermissionsConfig::parse(yaml).unwrap();
+        let drive_scopes = vec!["https://www.googleapis.com/auth/drive".to_string()];
+        // scopes-only role: denied because no method patterns
+        assert!(!config.is_method_allowed_with_scopes(
+            "s@co.com", "drive.files.list", &drive_scopes,
+        ));
+        // method-only role: denied because no scopes
+        assert!(!config.is_method_allowed_with_scopes(
+            "m@co.com", "drive.files.list", &drive_scopes,
+        ));
     }
 }
