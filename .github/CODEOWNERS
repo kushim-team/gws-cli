@@ -1,5 +1,8 @@
 # Codeowners
 
+# All files require vitocchi's review
+* @vitocchi
+
 # Core engine code strictly requires your review
 # Isolates agents to `skills/` or `src/helpers/` unless absolutely necessary
 /src/main.rs @jpoehnelt
