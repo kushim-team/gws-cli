@@ -4,11 +4,50 @@
 
 `gws` is a Rust CLI tool for interacting with Google Workspace APIs. It dynamically generates its command surface at runtime by parsing Google Discovery Service JSON documents.
 
+> [!NOTE]
+> This is a fork of [googleworkspace/cli](https://github.com/googleworkspace/cli) maintained by **HODL1** (kushim-team).
+> This is **not** an officially supported Google product.
+
+### Fork Branch Strategy
+
+This repository is a fork of [googleworkspace/cli](https://github.com/googleworkspace/cli) with the following branch strategy:
+
+| Branch | Purpose |
+|--------|---------|
+| `main` | Kept in sync with upstream `googleworkspace/cli` main. No custom changes. |
+| `custom` | All HODL1-specific changes are developed here. |
+
+#### Syncing with upstream
+
+```bash
+git fetch upstream
+git checkout main
+git merge upstream/main
+git checkout custom
+git merge main
+```
+
+Upstream updates are merged (not rebased) into `custom` to preserve a clean, shared-friendly history.
+
 > [!IMPORTANT]
 > **Dynamic Discovery**: This project does NOT use generated Rust crates (e.g., `google-drive3`) for API interaction. Instead, it fetches the Discovery JSON at runtime and builds `clap` commands dynamically. When adding a new service, you only need to register it in `src/services.rs` and verify the Discovery URL pattern in `src/discovery.rs`. Do NOT add new crates to `Cargo.toml` for standard Google APIs.
 
 > [!NOTE]
 > **Package Manager**: Use `pnpm` instead of `npm` for Node.js package management in this repository.
+
+## Code Change Discipline
+
+> [!IMPORTANT]
+> **Strictly adhere to the task scope.** Do not make any code changes unrelated to the assigned task.
+>
+> The following "drive-by" changes are **prohibited**:
+> - Deleting or rewriting existing comments (do not tidy up comments in code you are not touching for the task)
+> - Changing visibility (e.g., adding `pub(crate)`) when not required by the task
+> - Reformatting code (except automatic `cargo fmt` formatting)
+> - Renaming variables or refactoring based on style preference
+> - Adding or removing blank lines unnecessarily
+>
+> **Rule of thumb**: If removing a change would leave the task's functionality fully intact, that change is unnecessary. Do not include it.
 
 ## Build & Test
 

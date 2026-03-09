@@ -13,15 +13,23 @@
 // limitations under the License.
 
 //! Model Context Protocol (MCP) server implementation.
-//! Provides a stdio JSON-RPC server exposing Google Workspace APIs as MCP tools.
+//! Provides both stdio and Streamable HTTP transports exposing Google Workspace APIs as MCP tools.
+
+mod http;
+mod jsonrpc;
+pub(crate) mod oauth;
+pub(crate) mod permissions;
+mod stdio;
 
 use crate::discovery::RestResource;
 use crate::error::GwsError;
 use crate::services;
 use clap::{Arg, Command};
+use permissions::{filter_tools_by_permissions, tool_name_to_method_id, PermissionContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
 struct ServerConfig {
@@ -32,7 +40,7 @@ struct ServerConfig {
 
 fn build_mcp_cli() -> Command {
     Command::new("mcp")
-        .about("Starts the MCP server over stdio")
+        .about("Starts the MCP server (stdio or HTTP)")
         .arg(
             Arg::new("services")
                 .long("services")
@@ -54,11 +62,68 @@ fn build_mcp_cli() -> Command {
                 .action(clap::ArgAction::SetTrue)
                 .help("Expose service-specific helpers as tools"),
         )
+        .arg(
+            Arg::new("transport")
+                .long("transport")
+                .short('t')
+                .help("Transport mode: stdio or http")
+                .default_value("stdio")
+                .value_parser(["stdio", "http"]),
+        )
+        .arg(
+            Arg::new("port")
+                .long("port")
+                .short('p')
+                .help("Port for HTTP transport")
+                .default_value("8080")
+                .value_parser(clap::value_parser!(u16)),
+        )
+        .arg(
+            Arg::new("host")
+                .long("host")
+                .help("Host address to bind for HTTP transport (use 0.0.0.0 for all interfaces)")
+                .default_value("127.0.0.1"),
+        )
+        .arg(
+            Arg::new("allow-origin")
+                .long("allow-origin")
+                .help("Allowed Origin header values (comma-separated). If unset, localhost origins are allowed by default.")
+                .default_value(""),
+        )
+        .arg(
+            Arg::new("oauth-client-id")
+                .long("oauth-client-id")
+                .help("Google OAuth client ID for gateway auth (env: GOOGLE_WORKSPACE_CLI_CLIENT_ID)")
+                .env("GOOGLE_WORKSPACE_CLI_CLIENT_ID"),
+        )
+        .arg(
+            Arg::new("oauth-client-secret")
+                .help("Google OAuth client secret (env only, not accepted as CLI arg)")
+                .env("GOOGLE_WORKSPACE_CLI_CLIENT_SECRET")
+                .hide(true),
+        )
+        .arg(
+            Arg::new("gateway-base-url")
+                .long("gateway-base-url")
+                .help("Public base URL of this gateway (env: GWS_GATEWAY_BASE_URL)")
+                .env("GWS_GATEWAY_BASE_URL"),
+        )
+        .arg(
+            Arg::new("oauth-scopes")
+                .long("oauth-scopes")
+                .help("Space-separated OAuth scopes (env: GWS_OAUTH_SCOPES)")
+                .env("GWS_OAUTH_SCOPES")
+                .default_value(oauth::DEFAULT_OAUTH_SCOPES),
+        )
+        .arg(
+            Arg::new("permissions-file")
+                .long("permissions-file")
+                .help("Path to permissions YAML file (env: GWS_PERMISSIONS_FILE)")
+                .env("GWS_PERMISSIONS_FILE"),
+        )
 }
 
-pub async fn start(args: &[String]) -> Result<(), GwsError> {
-    // Parse args
-    let matches = build_mcp_cli().get_matches_from(args);
+fn parse_server_config(matches: &clap::ArgMatches) -> ServerConfig {
     let mut config = ServerConfig {
         services: Vec::new(),
         workflows: matches.get_flag("workflows"),
@@ -77,6 +142,146 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         }
     }
 
+    config
+}
+
+/// Initialise the `tracing` subscriber for structured JSON logging to stderr.
+///
+/// The subscriber outputs Cloud Logging compatible JSON with:
+/// - `severity` instead of `level` (Cloud Logging standard field)
+/// - Flat structure (no nested `fields` object)
+/// - ISO-8601 `timestamp`
+///
+/// The log level defaults to `info` and can be overridden with the
+/// `RUST_LOG` environment variable.
+fn init_usage_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt::fmt()
+        .event_format(CloudLoggingFormat)
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .init();
+}
+
+/// A custom formatter that outputs Cloud Logging compatible JSON.
+///
+/// Cloud Logging expects `severity` (not `level`) and flat key-value pairs
+/// (not nested under `fields`). This formatter produces output like:
+/// ```json
+/// {"severity":"INFO","timestamp":"2026-03-09T10:30:00.123Z","message":"tool call completed","email":"user@example.com","method_id":"drive_files_list","result":"success"}
+/// ```
+struct CloudLoggingFormat;
+
+impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for CloudLoggingFormat
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        _ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        use tracing::Level;
+
+        let severity = match *event.metadata().level() {
+            Level::ERROR => "ERROR",
+            Level::WARN => "WARNING",
+            Level::INFO => "INFO",
+            Level::DEBUG => "DEBUG",
+            Level::TRACE => "DEBUG",
+        };
+
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+
+        // Collect all fields into a map.
+        let mut fields = serde_json::Map::new();
+        let mut visitor = JsonFieldVisitor(&mut fields);
+        event.record(&mut visitor);
+
+        // Extract `message` from fields (tracing stores it as the first positional arg).
+        let message = fields
+            .remove("message")
+            .and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        // Build the top-level JSON object with flat structure.
+        write!(writer, "{{\"severity\":\"{severity}\",\"timestamp\":\"{timestamp}\",\"message\":")?;
+        serde_json::to_writer(WriterAdapter(&mut writer), &message)
+            .map_err(|_| std::fmt::Error)?;
+
+        for (key, value) in &fields {
+            write!(writer, ",\"{key}\":")?;
+            serde_json::to_writer(WriterAdapter(&mut writer), value)
+                .map_err(|_| std::fmt::Error)?;
+        }
+
+        writeln!(writer, "}}")
+    }
+}
+
+/// Visitor that collects tracing event fields into a `serde_json::Map`.
+struct JsonFieldVisitor<'a>(&'a mut serde_json::Map<String, serde_json::Value>);
+
+impl tracing::field::Visit for JsonFieldVisitor<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0
+            .insert(field.name().to_string(), serde_json::Value::String(value.to_string()));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(
+            field.name().to_string(),
+            serde_json::Value::String(format!("{:?}", value)),
+        );
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0
+            .insert(field.name().to_string(), serde_json::json!(value));
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0
+            .insert(field.name().to_string(), serde_json::json!(value));
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.0
+            .insert(field.name().to_string(), serde_json::json!(value));
+    }
+}
+
+/// Adapter to bridge `std::fmt::Write` (tracing's writer) to `std::io::Write` (serde_json).
+struct WriterAdapter<'a, 'b>(&'a mut tracing_subscriber::fmt::format::Writer<'b>);
+
+impl std::io::Write for WriterAdapter<'_, '_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let s = std::str::from_utf8(buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.0
+            .write_str(s)
+            .map_err(std::io::Error::other)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub async fn start(args: &[String]) -> Result<(), GwsError> {
+    let matches = build_mcp_cli().get_matches_from(args);
+    let config = parse_server_config(&matches);
+
+    init_usage_tracing();
+
     if config.services.is_empty() {
         eprintln!("[gws mcp] Warning: No services configured. Zero tools will be exposed.");
         eprintln!("[gws mcp] Re-run with: gws mcp -s <service> (e.g., -s drive,gmail,calendar)");
@@ -88,86 +293,92 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         );
     }
 
-    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
+    let transport = matches.get_one::<String>("transport").unwrap().as_str();
 
-    // Cache to hold generated tools configuration so we do not spam fetch from Google discovery
-    let mut tools_cache = None;
-
-    while let Ok(Some(line)) = stdin.next_line().await {
-        if line.trim().is_empty() {
-            continue;
+    // Parse optional OAuth config (all three fields required to enable)
+    let oauth_config = match (
+        matches.get_one::<String>("oauth-client-id"),
+        matches.get_one::<String>("oauth-client-secret"),
+        matches.get_one::<String>("gateway-base-url"),
+    ) {
+        (Some(client_id), Some(client_secret), Some(base_url)) => {
+            let base_url = base_url.trim_end_matches('/').to_string();
+            oauth::validate_gateway_base_url(&base_url).map_err(|e| {
+                GwsError::Validation(e)
+            })?;
+            let scopes = matches
+                .get_one::<String>("oauth-scopes")
+                .unwrap()
+                .clone();
+            eprintln!("[gws mcp] OAuth enabled for gateway auth");
+            Some(oauth::OAuthConfig {
+                client_id: client_id.clone(),
+                client_secret: client_secret.clone(),
+                base_url,
+                scopes,
+            })
         }
+        (None, None, None) => None,
+        _ => {
+            return Err(GwsError::Validation(
+                "OAuth requires all three: --oauth-client-id, --oauth-client-secret, --gateway-base-url".to_string(),
+            ));
+        }
+    };
 
-        match serde_json::from_str::<Value>(&line) {
-            Ok(req) => {
-                let is_notification = req.get("id").is_none();
-                let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-                let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+    // Load permissions config if specified.
+    let permissions_config = match matches.get_one::<String>("permissions-file") {
+        Some(path) => {
+            let pc = permissions::PermissionsConfig::load_from_file(path)
+                .map_err(GwsError::Other)?;
+            eprintln!("[gws mcp] Permissions loaded from {path}");
+            Some(pc)
+        }
+        None => None,
+    };
 
-                let result = handle_request(method, &params, &config, &mut tools_cache).await;
-
-                if !is_notification {
-                    let id = req.get("id").unwrap();
-                    let response = match result {
-                        Ok(res) => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": res
-                        }),
-                        Err(e) => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": {
-                                "code": -32603,
-                                "message": e.to_string()
-                            }
-                        }),
-                    };
-
-                    let mut out = match serde_json::to_string(&response) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("[gws mcp] Failed to serialize response: {e}");
-                            continue;
-                        }
-                    };
-                    out.push('\n');
-                    let _ = stdout.write_all(out.as_bytes()).await;
-                    let _ = stdout.flush().await;
-                }
+    match transport {
+        "http" => {
+            // OAuth and permissions are only supported in HTTP transport mode.
+            let port = *matches.get_one::<u16>("port").unwrap();
+            let host = matches.get_one::<String>("host").unwrap().clone();
+            let allow_origin = matches
+                .get_one::<String>("allow-origin")
+                .unwrap()
+                .clone();
+            eprintln!("[gws mcp] Starting HTTP transport on {host}:{port}");
+            http::serve(config, &host, port, &allow_origin, oauth_config, permissions_config).await
+        }
+        _ => {
+            // OAuth and permissions are not supported in stdio mode (local user
+            // authenticates via local credentials and has full access).
+            if oauth_config.is_some() {
+                eprintln!("[gws mcp] Warning: OAuth options are ignored in stdio mode. Use -t http for OAuth support.");
             }
-            Err(_) => {
-                let response = json!({
-                    "jsonrpc": "2.0",
-                    "id": Value::Null,
-                    "error": {
-                        "code": -32700,
-                        "message": "Parse error"
-                    }
-                });
-                let mut out = match serde_json::to_string(&response) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("[gws mcp] Failed to serialize error response: {e}");
-                        continue;
-                    }
-                };
-                out.push('\n');
-                let _ = stdout.write_all(out.as_bytes()).await;
-                let _ = stdout.flush().await;
+            if permissions_config.is_some() {
+                eprintln!("[gws mcp] Warning: --permissions-file is ignored in stdio mode. Use -t http for permission control.");
             }
+            eprintln!("[gws mcp] Starting stdio transport");
+            stdio::serve(config).await
         }
     }
-
-    Ok(())
 }
 
+// --- Shared request handler ---
+
+/// Handle a JSON-RPC MCP request.
+///
+/// `access_token` is an optional pre-authenticated Google OAuth access token.
+/// When provided (gateway mode), it is used for API calls instead of local credentials.
+///
+/// `user_email` is the authenticated user's email, used for usage-stats logging.
 async fn handle_request(
     method: &str,
     params: &Value,
     config: &ServerConfig,
-    tools_cache: &mut Option<Vec<Value>>,
+    tools_cache: &Mutex<Option<Vec<Value>>>,
+    access_token: Option<&str>,
+    perm_ctx: &PermissionContext<'_>,
 ) -> Result<Value, GwsError> {
     match method {
         "initialize" => Ok(json!({
@@ -185,20 +396,28 @@ async fn handle_request(
             Ok(json!({}))
         }
         "tools/list" => {
-            if tools_cache.is_none() {
-                *tools_cache = Some(build_tools_list(config).await?);
+            let mut cache = tools_cache.lock().await;
+            if cache.is_none() {
+                *cache = Some(build_tools_list(config).await?);
             }
+            let all_tools = cache.as_ref().unwrap();
+
+            // Phase 6: Filter tools by user permissions when configured.
+            let tools = filter_tools_by_permissions(all_tools, perm_ctx);
+
             Ok(json!({
-                "tools": tools_cache.as_ref().unwrap()
+                "tools": tools
             }))
         }
-        "tools/call" => handle_tools_call(params, config).await,
+        "tools/call" => handle_tools_call(params, config, access_token, perm_ctx).await,
         _ => Err(GwsError::Validation(format!(
             "Method not supported: {}",
             method
         ))),
     }
 }
+
+// --- Shared tool building logic ---
 
 async fn build_tools_list(config: &ServerConfig) -> Result<Vec<Value>, GwsError> {
     let mut tools = Vec::new();
@@ -325,11 +544,29 @@ fn walk_resources(prefix: &str, resources: &HashMap<String, RestResource>, tools
     }
 }
 
-async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Value, GwsError> {
+async fn handle_tools_call(
+    params: &Value,
+    config: &ServerConfig,
+    access_token: Option<&str>,
+    perm_ctx: &PermissionContext<'_>,
+) -> Result<Value, GwsError> {
     let tool_name = params
         .get("name")
         .and_then(|n| n.as_str())
         .ok_or_else(|| GwsError::Validation("Missing 'name' in tools/call".to_string()))?;
+
+    // Phase 5: Check permissions before executing the tool.
+    if let Some(perms) = perm_ctx.permissions {
+        if let Some(email) = perm_ctx.user_email {
+            let method_id = tool_name_to_method_id(tool_name);
+            if !perms.is_method_allowed(email, &method_id) {
+                return Err(GwsError::Validation(format!(
+                    "Permission denied: '{}' is not allowed for user '{}'",
+                    method_id, email
+                )));
+            }
+        }
+    }
 
     let default_args = json!({});
     let arguments = params.get("arguments").unwrap_or(&default_args);
@@ -425,13 +662,19 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
     };
 
     let scopes: Vec<&str> = method.scopes.iter().map(|s| s.as_str()).collect();
-    let (token, auth_method) = match crate::auth::get_token(&scopes, None).await {
-        Ok(t) => (Some(t), crate::executor::AuthMethod::OAuth),
-        Err(e) => {
-            eprintln!(
-                "[gws mcp] Warning: Authentication failed, proceeding without credentials: {e}"
-            );
-            (None, crate::executor::AuthMethod::None)
+    let (token, auth_method) = if let Some(tok) = access_token {
+        // Gateway mode: use the pre-authenticated user's Google token.
+        (Some(tok.to_string()), crate::executor::AuthMethod::OAuth)
+    } else {
+        // Local mode: use local credentials.
+        match crate::auth::get_token(&scopes, None).await {
+            Ok(t) => (Some(t), crate::executor::AuthMethod::OAuth),
+            Err(e) => {
+                eprintln!(
+                    "[gws mcp] Warning: Authentication failed, proceeding without credentials: {e}"
+                );
+                (None, crate::executor::AuthMethod::None)
+            }
         }
     };
 
@@ -451,7 +694,31 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
         &crate::formatter::OutputFormat::default(),
         true, // capture_output = true!
     )
-    .await?;
+    .await;
+
+    let email = perm_ctx.user_email.unwrap_or("anonymous");
+
+    match &result {
+        Ok(_) => {
+            tracing::info!(
+                email = email,
+                method_id = tool_name,
+                result = "success",
+                "tool call completed"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                email = email,
+                method_id = tool_name,
+                result = "error",
+                error = %e,
+                "tool call failed"
+            );
+        }
+    }
+
+    let result = result?;
 
     let text_content = match result {
         Some(val) => serde_json::to_string_pretty(&val).unwrap_or_else(|_| "[]".to_string()),
@@ -467,4 +734,104 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
         ],
         "isError": false
     }))
+}
+
+#[cfg(test)]
+mod usage_stats_tests {
+    use super::*;
+    use tokio::sync::Mutex;
+
+    fn no_perms_ctx(email: Option<&str>) -> PermissionContext<'_> {
+        PermissionContext {
+            user_email: email,
+            permissions: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_initialize_with_email() {
+        let tools_cache = Mutex::new(None);
+        let config = ServerConfig {
+            services: vec![],
+            workflows: false,
+            _helpers: false,
+        };
+        let perm_ctx = no_perms_ctx(Some("user@example.com"));
+        let result = handle_request(
+            "initialize",
+            &json!({}),
+            &config,
+            &tools_cache,
+            None,
+            &perm_ctx,
+        )
+        .await;
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["serverInfo"]["name"], "gws-mcp");
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_initialize_without_email() {
+        let tools_cache = Mutex::new(None);
+        let config = ServerConfig {
+            services: vec![],
+            workflows: false,
+            _helpers: false,
+        };
+        let perm_ctx = no_perms_ctx(None);
+        let result = handle_request(
+            "initialize",
+            &json!({}),
+            &config,
+            &tools_cache,
+            None,
+            &perm_ctx,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_tools_call_invalid_name_logs_error() {
+        let tools_cache = Mutex::new(None);
+        let config = ServerConfig {
+            services: vec!["drive".to_string()],
+            workflows: false,
+            _helpers: false,
+        };
+        let perm_ctx = no_perms_ctx(Some("alice@test.com"));
+        // Missing 'name' should return validation error
+        let result = handle_request(
+            "tools/call",
+            &json!({}),
+            &config,
+            &tools_cache,
+            None,
+            &perm_ctx,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_unsupported_method() {
+        let tools_cache = Mutex::new(None);
+        let config = ServerConfig {
+            services: vec![],
+            workflows: false,
+            _helpers: false,
+        };
+        let perm_ctx = no_perms_ctx(Some("user@test.com"));
+        let result = handle_request(
+            "unsupported/method",
+            &json!({}),
+            &config,
+            &tools_cache,
+            None,
+            &perm_ctx,
+        )
+        .await;
+        assert!(result.is_err());
+    }
 }
