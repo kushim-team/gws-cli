@@ -55,5 +55,5 @@
 
 ### Phase 7: 利用統計
 
-- [ ] 構造化ログ出力（email, timestamp, method ID, result）
+- [x] 構造化ログ出力（email, timestamp, method ID, result）
 - [ ] Cloud Logging への連携確認

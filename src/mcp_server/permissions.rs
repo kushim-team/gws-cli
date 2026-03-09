@@ -1,23 +1,10 @@
-// Copyright 2026 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 //! Permission control for the MCP Gateway (Phase 5 & 6).
 //!
 //! Loads a YAML configuration that maps users to roles and roles to
 //! allowed Discovery method IDs with wildcard support.
 
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashMap;
 
 /// Top-level permissions configuration loaded from YAML.
@@ -126,6 +113,56 @@ pub fn matches_pattern(pattern: &str, method_id: &str) -> bool {
         // Exact match
         pattern == method_id
     }
+}
+
+/// Permission context for the current request.
+pub(super) struct PermissionContext<'a> {
+    /// User email (None in local/stdio mode).
+    pub user_email: Option<&'a str>,
+    /// Permissions config (None if no permissions file loaded).
+    pub permissions: Option<&'a PermissionsConfig>,
+}
+
+/// Phase 6: Filter the tools list based on user permissions.
+/// Returns all tools if no permissions are configured.
+/// Returns empty list for unregistered users when permissions are configured.
+pub(super) fn filter_tools_by_permissions<'a>(
+    tools: &'a [Value],
+    perm_ctx: &PermissionContext<'_>,
+) -> Vec<&'a Value> {
+    let perms = match perm_ctx.permissions {
+        Some(p) => p,
+        None => return tools.iter().collect(), // No permissions -> all tools
+    };
+
+    let email = match perm_ctx.user_email {
+        Some(e) => e,
+        None => return tools.iter().collect(), // Local mode -> all tools
+    };
+
+    let patterns = match perms.get_allowed_patterns(email) {
+        Some(p) => p,
+        None => return vec![], // Unregistered user -> empty list
+    };
+
+    tools
+        .iter()
+        .filter(|tool| {
+            let tool_name = tool
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let method_id = tool_name_to_method_id(tool_name);
+            patterns
+                .iter()
+                .any(|p| matches_pattern(p, &method_id))
+        })
+        .collect()
+}
+
+/// Convert a tool name like `drive_files_list` to a method ID like `drive.files.list`.
+pub(super) fn tool_name_to_method_id(tool_name: &str) -> String {
+    tool_name.replace('_', ".")
 }
 
 #[cfg(test)]
@@ -318,5 +355,146 @@ users: {}
 "#;
         let config = PermissionsConfig::parse(yaml).unwrap();
         assert!(!config.is_method_allowed("anyone@company.com", "drive.files.list"));
+    }
+
+    #[test]
+    fn test_tool_name_to_method_id() {
+        assert_eq!(tool_name_to_method_id("drive_files_list"), "drive.files.list");
+        assert_eq!(
+            tool_name_to_method_id("gmail_users_messages_send"),
+            "gmail.users.messages.send"
+        );
+        assert_eq!(
+            tool_name_to_method_id("calendar_events_get"),
+            "calendar.events.get"
+        );
+    }
+
+    #[test]
+    fn test_filter_tools_no_permissions() {
+        use serde_json::json;
+        let tools = vec![
+            json!({"name": "drive_files_list", "description": "List files"}),
+            json!({"name": "gmail_users_messages_send", "description": "Send email"}),
+        ];
+        let perm_ctx = PermissionContext {
+            user_email: None,
+            permissions: None,
+        };
+        let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_tools_unregistered_user() {
+        use serde_json::json;
+        let tools = vec![
+            json!({"name": "drive_files_list", "description": "List files"}),
+        ];
+        let perms = PermissionsConfig::parse(
+            "roles:\n  admin:\n    allow:\n      - \"*\"\nusers:\n  admin@co.com:\n    role: admin\n",
+        )
+        .unwrap();
+        let perm_ctx = PermissionContext {
+            user_email: Some("unknown@co.com"),
+            permissions: Some(&perms),
+        };
+        let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_tools_admin_sees_all() {
+        use serde_json::json;
+        let tools = vec![
+            json!({"name": "drive_files_list", "description": "List files"}),
+            json!({"name": "gmail_users_messages_send", "description": "Send email"}),
+        ];
+        let perms = PermissionsConfig::parse(
+            "roles:\n  admin:\n    allow:\n      - \"*\"\nusers:\n  admin@co.com:\n    role: admin\n",
+        )
+        .unwrap();
+        let perm_ctx = PermissionContext {
+            user_email: Some("admin@co.com"),
+            permissions: Some(&perms),
+        };
+        let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_tools_reader_sees_subset() {
+        use serde_json::json;
+        let tools = vec![
+            json!({"name": "drive_files_list", "description": "List files"}),
+            json!({"name": "drive_files_get", "description": "Get file"}),
+            json!({"name": "drive_files_create", "description": "Create file"}),
+            json!({"name": "gmail_users_messages_send", "description": "Send email"}),
+        ];
+        let yaml = r#"
+roles:
+  reader:
+    allow:
+      - "drive.files.list"
+      - "drive.files.get"
+users:
+  reader@co.com:
+    role: reader
+"#;
+        let perms = PermissionsConfig::parse(yaml).unwrap();
+        let perm_ctx = PermissionContext {
+            user_email: Some("reader@co.com"),
+            permissions: Some(&perms),
+        };
+        let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0]["name"], "drive_files_list");
+        assert_eq!(filtered[1]["name"], "drive_files_get");
+    }
+
+    #[test]
+    fn test_filter_tools_wildcard_service() {
+        use serde_json::json;
+        let tools = vec![
+            json!({"name": "gmail_users_messages_list", "description": "List"}),
+            json!({"name": "gmail_users_messages_send", "description": "Send"}),
+            json!({"name": "gmail_users_labels_list", "description": "Labels"}),
+            json!({"name": "drive_files_list", "description": "Drive list"}),
+        ];
+        let yaml = r#"
+roles:
+  gmail-user:
+    allow:
+      - "gmail.*"
+users:
+  user@co.com:
+    role: gmail-user
+"#;
+        let perms = PermissionsConfig::parse(yaml).unwrap();
+        let perm_ctx = PermissionContext {
+            user_email: Some("user@co.com"),
+            permissions: Some(&perms),
+        };
+        let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn test_filter_tools_local_mode_no_email() {
+        use serde_json::json;
+        let tools = vec![
+            json!({"name": "drive_files_list", "description": "List files"}),
+        ];
+        let perms = PermissionsConfig::parse(
+            "roles:\n  admin:\n    allow:\n      - \"*\"\nusers:\n  admin@co.com:\n    role: admin\n",
+        )
+        .unwrap();
+        // No user email (local mode) -> all tools visible
+        let perm_ctx = PermissionContext {
+            user_email: None,
+            permissions: Some(&perms),
+        };
+        let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
+        assert_eq!(filtered.len(), 1);
     }
 }
