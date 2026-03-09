@@ -60,6 +60,17 @@ cargo clippy -- -D warnings  # Lint check
 cargo test           # Run tests
 ```
 
+> [!IMPORTANT]
+> **No library target**: This project only has a `[[bin]]` target (`gws`), not a `[lib]` target. When running a subset of tests, use `--bin gws` instead of `--lib`.
+>
+> ```bash
+> # CORRECT
+> cargo test --bin gws mcp_server::permissions
+>
+> # WRONG — will fail with "no library targets found"
+> cargo test --lib mcp_server::permissions
+> ```
+
 ## Changesets
 
 Every PR must include a changeset file. Create one at `.changeset/<descriptive-name>.md`:
