@@ -16,9 +16,9 @@ name: Policy
 
 on:
   push:
-    branches: [main]
+    branches: [main, custom]
   pull_request:
-    branches: [main]
+    branches: [main, custom]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
