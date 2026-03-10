@@ -4,40 +4,6 @@
 
 `gws` is a Rust CLI tool for interacting with Google Workspace APIs. It dynamically generates its command surface at runtime by parsing Google Discovery Service JSON documents.
 
-> [!NOTE]
-> This is a fork of [googleworkspace/cli](https://github.com/googleworkspace/cli) maintained by **HODL1** (kushim-team).
-> This is **not** an officially supported Google product.
-
-### Fork Branch Strategy
-
-This repository is a fork of [googleworkspace/cli](https://github.com/googleworkspace/cli) with the following branch strategy:
-
-| Branch | Purpose |
-|--------|---------|
-| `main` | Kept in sync with upstream `googleworkspace/cli` main. No custom changes. |
-| `custom` | All HODL1-specific changes are developed here. |
-
-#### Syncing with upstream
-
-```bash
-git fetch upstream
-git checkout main
-git merge upstream/main
-git checkout custom
-git merge main
-```
-
-Upstream updates are merged (not rebased) into `custom` to preserve a clean, shared-friendly history.
-
-#### Versioning
-
-The `custom` branch uses `<upstream-version>-hodl1.<N>` versioning (e.g. `0.9.1-hodl1.1`).
-
-- `<upstream-version>` — the upstream release this fork is based on
-- `-hodl1.<N>` — HODL1 fork patch number, incremented for each custom release
-
-When syncing with a new upstream version, reset `N` to 1 (e.g. `0.10.0-hodl1.1`). Version is set in both `Cargo.toml` and `package.json`.
-
 > [!IMPORTANT]
 > **Dynamic Discovery**: This project does NOT use generated Rust crates (e.g., `google-drive3`) for API interaction. Instead, it fetches the Discovery JSON at runtime and builds `clap` commands dynamically. When adding a new service, you only need to register it in `src/services.rs` and verify the Discovery URL pattern in `src/discovery.rs`. Do NOT add new crates to `Cargo.toml` for standard Google APIs.
 
@@ -94,14 +60,7 @@ Brief description of the change
 
 Use `patch` for fixes/chores, `minor` for new features, `major` for breaking changes. The CI policy check will fail without a changeset.
 
-## Architecture
-
-The CLI uses a **two-phase argument parsing** strategy:
-
-1. Parse argv to extract the service name (e.g., `drive`)
-2. Fetch the service's Discovery Document, build a dynamic `clap::Command` tree, then re-parse
-
-### Source Layout
+## Source Layout
 
 | File                      | Purpose                                                                                   |
 | ------------------------- | ----------------------------------------------------------------------------------------- |
@@ -223,41 +182,3 @@ Use these labels to categorize pull requests and issues:
 - `area: auth` — OAuth, credentials, multi-account, ADC
 - `area: skills` — AI skill generation and management
 
-## Environment Variables
-
-### Authentication
-
-| Variable | Description |
-|---|---|
-| `GOOGLE_WORKSPACE_CLI_TOKEN` | Pre-obtained OAuth2 access token (highest priority; bypasses all credential file loading) |
-| `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` | Path to OAuth credentials JSON (no default; if unset, falls back to credentials secured by the OS Keyring and encrypted in `~/.config/gws/`) |
-
-| `GOOGLE_APPLICATION_CREDENTIALS` | Standard Google ADC path; used as fallback when no gws-specific credentials are configured |
-
-### Configuration
-
-| Variable | Description |
-|---|---|
-| `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` | Override the config directory (default: `~/.config/gws`) |
-
-### OAuth Client
-
-| Variable | Description |
-|---|---|
-| `GOOGLE_WORKSPACE_CLI_CLIENT_ID` | OAuth client ID (for `gws auth login` when no `client_secret.json` is saved) |
-| `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET` | OAuth client secret (paired with `CLIENT_ID` above) |
-
-### Sanitization (Model Armor)
-
-| Variable | Description |
-|---|---|
-| `GOOGLE_WORKSPACE_CLI_SANITIZE_TEMPLATE` | Default Model Armor template (overridden by `--sanitize` flag) |
-| `GOOGLE_WORKSPACE_CLI_SANITIZE_MODE` | `warn` (default) or `block` |
-
-### Helpers
-
-| Variable | Description |
-|---|---|
-| `GOOGLE_WORKSPACE_PROJECT_ID` | GCP project ID override for quota/billing and fallback for helper commands (overridden by `--project` flag) |
-
-All variables can also live in a `.env` file (loaded via `dotenvy`).
