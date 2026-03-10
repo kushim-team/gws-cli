@@ -13,13 +13,12 @@
 // limitations under the License.
 
 //! Model Context Protocol (MCP) server implementation.
-//! Provides both stdio and Streamable HTTP transports exposing Google Workspace APIs as MCP tools.
+//! Provides Streamable HTTP transport exposing Google Workspace APIs as MCP tools.
 
 mod http;
 mod jsonrpc;
 pub(crate) mod oauth;
 pub(crate) mod permissions;
-mod stdio;
 
 use crate::discovery::RestResource;
 use crate::error::GwsError;
@@ -47,7 +46,7 @@ struct ServerConfig {
 
 fn build_mcp_cli() -> Command {
     Command::new("mcp")
-        .about("Starts the MCP server (stdio or HTTP)")
+        .about("Starts the MCP server (HTTP)")
         .arg(
             Arg::new("services")
                 .long("services")
@@ -68,14 +67,6 @@ fn build_mcp_cli() -> Command {
                 .short('e')
                 .action(clap::ArgAction::SetTrue)
                 .help("Expose service-specific helpers as tools"),
-        )
-        .arg(
-            Arg::new("transport")
-                .long("transport")
-                .short('t')
-                .help("Transport mode: stdio or http")
-                .default_value("stdio")
-                .value_parser(["stdio", "http"]),
         )
         .arg(
             Arg::new("port")
@@ -314,8 +305,6 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         eprintln!("[gws mcp] Tool mode: {:?}", config.tool_mode);
     }
 
-    let transport = matches.get_one::<String>("transport").unwrap().as_str();
-
     // Parse optional OAuth config (all three fields required to enable)
     let oauth_config = match (
         matches.get_one::<String>("oauth-client-id"),
@@ -382,31 +371,14 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         (oc, _) => oc,
     };
 
-    match transport {
-        "http" => {
-            // OAuth and permissions are only supported in HTTP transport mode.
-            let port = *matches.get_one::<u16>("port").unwrap();
-            let host = matches.get_one::<String>("host").unwrap().clone();
-            let allow_origin = matches
-                .get_one::<String>("allow-origin")
-                .unwrap()
-                .clone();
-            eprintln!("[gws mcp] Starting HTTP transport on {host}:{port}");
-            http::serve(config, &host, port, &allow_origin, oauth_config, permissions_config).await
-        }
-        _ => {
-            // OAuth and permissions are not supported in stdio mode (local user
-            // authenticates via local credentials and has full access).
-            if oauth_config.is_some() {
-                eprintln!("[gws mcp] Warning: OAuth options are ignored in stdio mode. Use -t http for OAuth support.");
-            }
-            if permissions_config.is_some() {
-                eprintln!("[gws mcp] Warning: --permissions-file is ignored in stdio mode. Use -t http for permission control.");
-            }
-            eprintln!("[gws mcp] Starting stdio transport");
-            stdio::serve(config).await
-        }
-    }
+    let port = *matches.get_one::<u16>("port").unwrap();
+    let host = matches.get_one::<String>("host").unwrap().clone();
+    let allow_origin = matches
+        .get_one::<String>("allow-origin")
+        .unwrap()
+        .clone();
+    eprintln!("[gws mcp] Starting HTTP transport on {host}:{port}");
+    http::serve(config, &host, port, &allow_origin, oauth_config, permissions_config).await
 }
 
 // --- Shared request handler ---
