@@ -29,6 +29,15 @@ git merge main
 
 Upstream updates are merged (not rebased) into `custom` to preserve a clean, shared-friendly history.
 
+#### Versioning
+
+The `custom` branch uses `<upstream-version>-hodl1.<N>` versioning (e.g. `0.9.1-hodl1.1`).
+
+- `<upstream-version>` — the upstream release this fork is based on
+- `-hodl1.<N>` — HODL1 fork patch number, incremented for each custom release
+
+When syncing with a new upstream version, reset `N` to 1 (e.g. `0.10.0-hodl1.1`). Version is set in both `Cargo.toml` and `package.json`.
+
 > [!IMPORTANT]
 > **Dynamic Discovery**: This project does NOT use generated Rust crates (e.g., `google-drive3`) for API interaction. Instead, it fetches the Discovery JSON at runtime and builds `clap` commands dynamically. When adding a new service, you only need to register it in `src/services.rs` and verify the Discovery URL pattern in `src/discovery.rs`. Do NOT add new crates to `Cargo.toml` for standard Google APIs.
 

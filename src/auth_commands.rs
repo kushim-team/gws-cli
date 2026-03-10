@@ -564,7 +564,6 @@ fn map_service_to_scope_prefix(service: &str) -> &str {
     }
 }
 
-
 /// Remove restrictive scopes that are redundant when broader alternatives
 /// are present. For example, `gmail.metadata` restricts query parameters
 /// and is unnecessary when `gmail.modify`, `gmail.readonly`, or the full
