@@ -9,6 +9,7 @@ This document describes how the HODL1 fork manages upstream GitHub Actions workf
 | Branch triggers (`main` only) | Add `custom` to `branches:` | CI must run on `custom` branch PRs too |
 | Google-internal services (CLA, ClawHub, internal npm) | Delete the workflow | Not available outside Google infrastructure |
 | Google-internal bot integrations (Gemini Code Assist) | Remove the specific jobs | Not available outside Google infrastructure |
+| Jobs requiring Google-internal secrets (`GOOGLEWORKSPACE_BOT_TOKEN`, `GOOGLE_CREDENTIALS_JSON`) | Remove the specific jobs | Secrets not available in fork |
 | Upstream release pipelines (cargo-dist, changesets) | Delete the workflow | Fork uses its own versioning (`-hodl1.N`) |
 | Workflows already covering `custom` (schedule, `branches-ignore`) | Keep as-is | No changes needed |
 
@@ -18,10 +19,10 @@ This document describes how the HODL1 fork manages upstream GitHub Actions workf
 
 | Workflow | File | Changes from upstream |
 |----------|------|----------------------|
-| CI | `ci.yml` | Added `custom` to push/PR branch triggers |
 | Coverage | `coverage.yml` | Added `custom` to push/PR branch triggers |
 | Policy | `policy.yml` | Added `custom` to push/PR branch triggers |
-| Automation | `automation.yml` | Added `custom` to push trigger; removed Gemini review/reviewed jobs and `pull_request_review` trigger |
+| Automation | `automation.yml` | Added `custom` to push trigger; removed Gemini review/reviewed jobs, `pull_request_review` trigger, and File Labeler job |
+| CI | `ci.yml` | Added `custom` to push/PR branch triggers; removed API Smoketest job |
 
 ### Kept as-is (no changes needed)
 
@@ -39,6 +40,8 @@ This document describes how the HODL1 fork manages upstream GitHub Actions workf
 | Release | `release.yml` | cargo-dist + Google internal npm registry (`wombat-dressing-room`) |
 | Release (Changeset) | `release-changesets.yml` | Upstream release cycle, depends on `GOOGLEWORKSPACE_BOT_TOKEN` |
 | Publish Skills | `publish-skills.yml` | Publishes to ClawHub (Google internal platform) |
+| File Labeler (job) | `automation.yml` | Requires `GOOGLEWORKSPACE_BOT_TOKEN`, not needed in fork |
+| API Smoketest (job) | `ci.yml` | Requires `GOOGLE_CREDENTIALS_JSON` secret, not available in fork |
 
 ## When upstream workflows change
 
