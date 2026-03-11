@@ -93,19 +93,22 @@ fn build_mcp_cli() -> Command {
             Arg::new("oauth-client-id")
                 .long("oauth-client-id")
                 .help("Google OAuth client ID for gateway auth (env: GOOGLE_WORKSPACE_CLI_CLIENT_ID)")
-                .env("GOOGLE_WORKSPACE_CLI_CLIENT_ID"),
+                .env("GOOGLE_WORKSPACE_CLI_CLIENT_ID")
+                .required(true),
         )
         .arg(
             Arg::new("oauth-client-secret")
                 .help("Google OAuth client secret (env only, not accepted as CLI arg)")
                 .env("GOOGLE_WORKSPACE_CLI_CLIENT_SECRET")
-                .hide(true),
+                .hide(true)
+                .required(true),
         )
         .arg(
             Arg::new("gateway-base-url")
                 .long("gateway-base-url")
                 .help("Public base URL of this gateway (env: GWS_GATEWAY_BASE_URL)")
-                .env("GWS_GATEWAY_BASE_URL"),
+                .env("GWS_GATEWAY_BASE_URL")
+                .required(true),
         )
         .arg(
             Arg::new("oauth-scopes")
@@ -307,30 +310,19 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         eprintln!("[gws mcp] Tool mode: {:?}", config.tool_mode);
     }
 
-    // Parse optional OAuth config (all three fields required to enable)
-    let oauth_config = match (
-        matches.get_one::<String>("oauth-client-id"),
-        matches.get_one::<String>("oauth-client-secret"),
-        matches.get_one::<String>("gateway-base-url"),
-    ) {
-        (Some(client_id), Some(client_secret), Some(base_url)) => {
-            let base_url = base_url.trim_end_matches('/').to_string();
-            oauth::validate_gateway_base_url(&base_url).map_err(GwsError::Validation)?;
-            let scopes = matches.get_one::<String>("oauth-scopes").unwrap().clone();
-            eprintln!("[gws mcp] OAuth enabled for gateway auth");
-            Some(oauth::OAuthConfig {
-                client_id: client_id.clone(),
-                client_secret: client_secret.clone(),
-                base_url,
-                scopes,
-            })
-        }
-        (None, None, None) => None,
-        _ => {
-            return Err(GwsError::Validation(
-                "OAuth requires all three: --oauth-client-id, --oauth-client-secret, --gateway-base-url".to_string(),
-            ));
-        }
+    // Parse required OAuth config.
+    let client_id = matches.get_one::<String>("oauth-client-id").unwrap();
+    let client_secret = matches.get_one::<String>("oauth-client-secret").unwrap();
+    let base_url = matches.get_one::<String>("gateway-base-url").unwrap();
+    let base_url = base_url.trim_end_matches('/').to_string();
+    oauth::validate_gateway_base_url(&base_url).map_err(GwsError::Validation)?;
+    let scopes = matches.get_one::<String>("oauth-scopes").unwrap().clone();
+    eprintln!("[gws mcp] OAuth enabled for gateway auth");
+    let oauth_config = oauth::OAuthConfig {
+        client_id: client_id.clone(),
+        client_secret: client_secret.clone(),
+        base_url,
+        scopes,
     };
 
     // Load permissions config if specified.
@@ -348,32 +340,29 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
     // --oauth-scopes, narrow the OAuth consent to the union of all role
     // scopes.  This ensures the gateway token only carries the scopes that
     // at least one role needs (principle of least privilege).
-    let oauth_config = match (oauth_config, &permissions_config) {
-        (Some(mut oc), Some(pc)) => {
-            let user_explicitly_set = matches.value_source("oauth-scopes")
-                == Some(clap::parser::ValueSource::CommandLine);
-            let union = pc.all_scopes_union();
-            if !user_explicitly_set && !union.is_empty() {
-                let mut scopes = vec![
-                    "openid".to_string(),
-                    "email".to_string(),
-                    "profile".to_string(),
-                ];
-                for s in union {
-                    if !scopes.contains(&s) {
-                        scopes.push(s);
-                    }
+    let mut oauth_config = oauth_config;
+    if let Some(pc) = &permissions_config {
+        let user_explicitly_set = matches.value_source("oauth-scopes")
+            == Some(clap::parser::ValueSource::CommandLine);
+        let union = pc.all_scopes_union();
+        if !user_explicitly_set && !union.is_empty() {
+            let mut scopes = vec![
+                "openid".to_string(),
+                "email".to_string(),
+                "profile".to_string(),
+            ];
+            for s in union {
+                if !scopes.contains(&s) {
+                    scopes.push(s);
                 }
-                oc.scopes = scopes.join(" ");
-                eprintln!(
-                    "[gws mcp] OAuth scopes narrowed to permissions union: {}",
-                    oc.scopes
-                );
             }
-            Some(oc)
+            oauth_config.scopes = scopes.join(" ");
+            eprintln!(
+                "[gws mcp] OAuth scopes narrowed to permissions union: {}",
+                oauth_config.scopes
+            );
         }
-        (oc, _) => oc,
-    };
+    }
 
     let port = *matches.get_one::<u16>("port").unwrap();
     let host = matches.get_one::<String>("host").unwrap().clone();
@@ -394,8 +383,8 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
 
 /// Handle a JSON-RPC MCP request.
 ///
-/// `access_token` is an optional pre-authenticated Google OAuth access token.
-/// When provided (gateway mode), it is used for API calls instead of local credentials.
+/// `access_token` is the authenticated user's Google OAuth access token,
+/// used for API calls.
 ///
 /// `user_email` is the authenticated user's email, used for usage-stats logging.
 async fn handle_request(
@@ -403,7 +392,7 @@ async fn handle_request(
     params: &Value,
     config: &ServerConfig,
     tools_cache: &Mutex<Option<Vec<Value>>>,
-    access_token: Option<&str>,
+    access_token: &str,
     perm_ctx: &PermissionContext<'_>,
 ) -> Result<Value, GwsError> {
     match method {
@@ -903,7 +892,7 @@ fn find_resource<'a>(
 async fn handle_tools_call(
     params: &Value,
     config: &ServerConfig,
-    access_token: Option<&str>,
+    access_token: &str,
     perm_ctx: &PermissionContext<'_>,
 ) -> Result<Value, GwsError> {
     let tool_name = params
@@ -1032,7 +1021,7 @@ async fn execute_mcp_method(
     doc: &crate::discovery::RestDescription,
     method: &crate::discovery::RestMethod,
     arguments: &Value,
-    access_token: Option<&str>,
+    access_token: &str,
     perm_ctx: &PermissionContext<'_>,
     tool_name: &str,
 ) -> Result<Value, GwsError> {
@@ -1080,22 +1069,8 @@ async fn execute_mcp_method(
         page_delay_ms: 100,
     };
 
-    let scopes: Vec<&str> = crate::select_scope(&method.scopes).into_iter().collect();
-    let (token, auth_method) = if let Some(tok) = access_token {
-        // Gateway mode: use the pre-authenticated user's Google token.
-        (Some(tok.to_string()), crate::executor::AuthMethod::OAuth)
-    } else {
-        // Local mode: use local credentials.
-        match crate::auth::get_token(&scopes).await {
-            Ok(t) => (Some(t), crate::executor::AuthMethod::OAuth),
-            Err(e) => {
-                eprintln!(
-                    "[gws mcp] Warning: Authentication failed, proceeding without credentials: {e}"
-                );
-                (None, crate::executor::AuthMethod::None)
-            }
-        }
-    };
+    let token = Some(access_token.to_string());
+    let auth_method = crate::executor::AuthMethod::OAuth;
 
     let result = crate::executor::execute_method(
         doc,
@@ -1182,7 +1157,7 @@ mod usage_stats_tests {
             &json!({}),
             &config,
             &tools_cache,
-            None,
+            "test-token",
             &perm_ctx,
         )
         .await;
@@ -1206,7 +1181,7 @@ mod usage_stats_tests {
             &json!({}),
             &config,
             &tools_cache,
-            None,
+            "test-token",
             &perm_ctx,
         )
         .await;
@@ -1229,7 +1204,7 @@ mod usage_stats_tests {
             &json!({}),
             &config,
             &tools_cache,
-            None,
+            "test-token",
             &perm_ctx,
         )
         .await;
@@ -1254,7 +1229,7 @@ mod usage_stats_tests {
             &json!({}),
             &config,
             &tools_cache,
-            None,
+            "test-token",
             &perm_ctx,
         )
         .await;
@@ -1521,16 +1496,28 @@ mod tests {
 
     #[test]
     fn test_cli_tool_mode_default_is_full() {
+        // Set env vars for required args that are env-only.
+        std::env::set_var("GOOGLE_WORKSPACE_CLI_CLIENT_SECRET", "test-secret");
         let cli = build_mcp_cli();
-        let matches = cli.get_matches_from(vec!["mcp"]);
+        let matches = cli.get_matches_from(vec![
+            "mcp",
+            "--oauth-client-id", "test-id",
+            "--gateway-base-url", "https://gw.example.com",
+        ]);
         let mode = matches.get_one::<String>("tool-mode").unwrap();
         assert_eq!(mode, "full");
     }
 
     #[test]
     fn test_cli_tool_mode_compact() {
+        std::env::set_var("GOOGLE_WORKSPACE_CLI_CLIENT_SECRET", "test-secret");
         let cli = build_mcp_cli();
-        let matches = cli.get_matches_from(vec!["mcp", "--tool-mode", "compact"]);
+        let matches = cli.get_matches_from(vec![
+            "mcp",
+            "--oauth-client-id", "test-id",
+            "--gateway-base-url", "https://gw.example.com",
+            "--tool-mode", "compact",
+        ]);
         let mode = matches.get_one::<String>("tool-mode").unwrap();
         assert_eq!(mode, "compact");
     }

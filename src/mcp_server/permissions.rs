@@ -198,7 +198,7 @@ pub fn matches_pattern(pattern: &str, method_id: &str) -> bool {
 
 /// Permission context for the current request.
 pub(super) struct PermissionContext<'a> {
-    /// User email (None when OAuth is not configured).
+    /// User email (None if the session lookup failed).
     pub user_email: Option<&'a str>,
     /// Permissions config (None if no permissions file loaded).
     pub permissions: Option<&'a PermissionsConfig>,
@@ -222,7 +222,7 @@ pub(super) fn filter_tools_by_permissions<'a>(
 
     let email = match perm_ctx.user_email {
         Some(e) => e,
-        None => return tools.iter().collect(), // Local mode -> all tools
+        None => return vec![], // No email resolved -> deny all
     };
 
     let user_def = match perms.users.get(email) {
@@ -606,20 +606,20 @@ users:
     }
 
     #[test]
-    fn test_filter_tools_local_mode_no_email() {
+    fn test_filter_tools_no_email_denies_all() {
         use serde_json::json;
         let tools = vec![json!({"name": "drive_files_list", "description": "List files"})];
         let perms = PermissionsConfig::parse(
             "roles:\n  admin:\n    scopes:\n      - \"https://www.googleapis.com/auth/drive\"\n    method:\n      - \"*\"\nusers:\n  admin@co.com:\n    role: admin\n",
         )
         .unwrap();
-        // No user email (local mode) -> all tools visible
+        // No user email -> deny all tools
         let perm_ctx = PermissionContext {
             user_email: None,
             permissions: Some(&perms),
         };
         let filtered = filter_tools_by_permissions(&tools, &perm_ctx);
-        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.len(), 0);
     }
 
     // ── Scope-based permission tests ──
