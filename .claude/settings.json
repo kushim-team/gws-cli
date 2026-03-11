@@ -1,5 +1,29 @@
 {
   "attribution": {
     "commit": ""
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo fmt",
+            "statusMessage": "Running cargo fmt..."
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo fmt",
+            "statusMessage": "Running cargo fmt..."
+          }
+        ]
+      }
+    ]
   }
 }

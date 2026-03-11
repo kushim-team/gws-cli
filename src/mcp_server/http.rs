@@ -1,6 +1,7 @@
 use super::jsonrpc::{build_jsonrpc_response, build_parse_error_response};
 use super::oauth::{self, OAuthConfig, TokenStore};
 use super::permissions::{PermissionContext, PermissionsConfig};
+use super::session_store::SessionPersistence;
 use super::*;
 use axum::body::Body;
 use axum::extract::{Query, State};
@@ -26,6 +27,7 @@ pub(super) async fn serve(
     allow_origin: &str,
     oauth_config: OAuthConfig,
     permissions: Option<PermissionsConfig>,
+    persistence: Arc<dyn SessionPersistence>,
 ) -> Result<(), GwsError> {
     let allowed_origins: Vec<String> = if allow_origin.is_empty() {
         vec![]
@@ -36,13 +38,18 @@ pub(super) async fn serve(
             .collect()
     };
 
+    let mut token_store = TokenStore::new(persistence);
+    if let Err(e) = token_store.load_persisted_sessions().await {
+        tracing::warn!("Failed to load persisted sessions: {e}");
+    }
+
     let state = Arc::new(AppState {
         config,
         tools_cache: Mutex::new(None),
         sessions: Mutex::new(HashMap::new()),
         allowed_origins,
         oauth_config,
-        token_store: Mutex::new(TokenStore::new()),
+        token_store: Mutex::new(token_store),
         permissions,
     });
 
@@ -755,12 +762,17 @@ async fn handle_token_authorization_code(
         store
             .bearer_sessions
             .insert(bearer_token.clone(), pending_code.session);
+        store.persist().await;
     }
 
     let mut resp_headers = cors_headers;
     resp_headers.insert(
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
+    );
+    resp_headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
     );
 
     let resp_body = json!({
@@ -839,12 +851,17 @@ async fn handle_token_refresh(
             return token_error_response("server_error", "Too many active sessions", cors_headers);
         }
         store.bearer_sessions.insert(new_bearer.clone(), session);
+        store.persist().await;
     }
 
     let mut resp_headers = cors_headers;
     resp_headers.insert(
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
+    );
+    resp_headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
     );
 
     let resp_body = json!({
@@ -1031,7 +1048,9 @@ mod tests {
             sessions: Mutex::new(HashMap::new()),
             allowed_origins,
             oauth_config: test_oauth_config(),
-            token_store: Mutex::new(TokenStore::new()),
+            token_store: Mutex::new(TokenStore::new(Arc::new(
+                super::session_store::InMemoryPersistence,
+            ))),
             permissions: None,
         });
         // Pre-register a bearer session for tests that need auth.

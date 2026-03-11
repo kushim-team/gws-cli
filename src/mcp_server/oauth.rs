@@ -4,9 +4,12 @@
 //! PKCE validation, and automatic token refresh.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use sha2::Digest;
 use tokio::sync::Mutex;
+
+use super::session_store::SessionPersistence;
 
 /// Default Google OAuth scopes requested during consent.
 pub const DEFAULT_OAUTH_SCOPES: &str = "\
@@ -57,7 +60,7 @@ impl std::fmt::Debug for OAuthConfig {
 }
 
 /// Stored Google OAuth tokens for a user.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GoogleTokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -75,7 +78,7 @@ impl GoogleTokens {
 }
 
 /// An authenticated user session backed by Google OAuth tokens.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UserSession {
     #[allow(dead_code)] // Used in Phase 5 (permissions) and Phase 7 (logging)
     pub email: String,
@@ -114,7 +117,7 @@ pub struct RegisteredClient {
     pub client_id_issued_at: i64,
 }
 
-/// In-memory token and session store.
+/// Token and session store with pluggable persistence backend.
 pub struct TokenStore {
     /// Our bearer token -> authenticated user session.
     pub bearer_sessions: HashMap<String, UserSession>,
@@ -124,15 +127,33 @@ pub struct TokenStore {
     pub pending_auths: HashMap<String, PendingAuth>,
     /// Dynamically registered clients.
     pub registered_clients: HashMap<String, RegisteredClient>,
+    /// Persistence backend for bearer sessions.
+    persistence: Arc<dyn SessionPersistence>,
 }
 
 impl TokenStore {
-    pub fn new() -> Self {
+    pub fn new(persistence: Arc<dyn SessionPersistence>) -> Self {
         Self {
             bearer_sessions: HashMap::new(),
             pending_codes: HashMap::new(),
             pending_auths: HashMap::new(),
             registered_clients: HashMap::new(),
+            persistence,
+        }
+    }
+
+    /// Load persisted sessions from the backend into memory.
+    pub async fn load_persisted_sessions(&mut self) -> anyhow::Result<()> {
+        let sessions = self.persistence.load().await?;
+        self.bearer_sessions = sessions;
+        Ok(())
+    }
+
+    /// Persist current bearer sessions to the backend.
+    /// Errors are logged but not propagated to avoid blocking request handling.
+    pub async fn persist(&self) {
+        if let Err(e) = self.persistence.save(&self.bearer_sessions).await {
+            tracing::warn!("Failed to persist sessions: {e}");
         }
     }
 
@@ -375,6 +396,7 @@ pub async fn get_valid_google_token(
         if let Some(session) = guard.bearer_sessions.get_mut(bearer_token) {
             session.google_tokens = new_tokens;
         }
+        guard.persist().await;
         return Ok(access_token);
     }
 
@@ -420,6 +442,11 @@ pub fn build_google_auth_url(config: &OAuthConfig, state: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp_server::session_store::InMemoryPersistence;
+
+    fn test_token_store() -> TokenStore {
+        TokenStore::new(Arc::new(InMemoryPersistence))
+    }
 
     #[test]
     fn test_validate_pkce_s256() {
@@ -493,7 +520,7 @@ mod tests {
 
     #[test]
     fn test_token_store_bearer_sessions() {
-        let mut store = TokenStore::new();
+        let mut store = test_token_store();
         assert!(store.bearer_sessions.get("tok").is_none());
 
         store.bearer_sessions.insert(
@@ -516,7 +543,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_email_for_bearer_found() {
-        let store = tokio::sync::Mutex::new(TokenStore::new());
+        let store = tokio::sync::Mutex::new(test_token_store());
         {
             let mut guard = store.lock().await;
             guard.bearer_sessions.insert(
@@ -538,14 +565,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_email_for_bearer_not_found() {
-        let store = tokio::sync::Mutex::new(TokenStore::new());
+        let store = tokio::sync::Mutex::new(test_token_store());
         let email = get_email_for_bearer(&store, "nonexistent").await;
         assert!(email.is_none());
     }
 
     #[test]
     fn test_token_store_pending_auth_lifecycle() {
-        let mut store = TokenStore::new();
+        let mut store = test_token_store();
         store.pending_auths.insert(
             "state1".to_string(),
             PendingAuth {
@@ -566,7 +593,7 @@ mod tests {
 
     #[test]
     fn test_token_store_pending_code_lifecycle() {
-        let mut store = TokenStore::new();
+        let mut store = test_token_store();
         store.pending_codes.insert(
             "code1".to_string(),
             PendingCode {
@@ -700,7 +727,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_expired() {
-        let mut store = TokenStore::new();
+        let mut store = test_token_store();
         let past = chrono::Utc::now().timestamp() - 10000;
 
         store.pending_auths.insert(
