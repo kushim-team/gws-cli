@@ -315,7 +315,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
     ) {
         (Some(client_id), Some(client_secret), Some(base_url)) => {
             let base_url = base_url.trim_end_matches('/').to_string();
-            oauth::validate_gateway_base_url(&base_url).map_err(|e| GwsError::Validation(e))?;
+            oauth::validate_gateway_base_url(&base_url).map_err(GwsError::Validation)?;
             let scopes = matches.get_one::<String>("oauth-scopes").unwrap().clone();
             eprintln!("[gws mcp] OAuth enabled for gateway auth");
             Some(oauth::OAuthConfig {
