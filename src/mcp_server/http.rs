@@ -160,10 +160,7 @@ fn unauthorized_response(state: &AppState, msg: &str) -> Response {
         .into_response()
 }
 
-async fn resolve_google_token(
-    headers: &HeaderMap,
-    state: &AppState,
-) -> Result<String, Response> {
+async fn resolve_google_token(headers: &HeaderMap, state: &AppState) -> Result<String, Response> {
     let bearer = extract_bearer_token(headers)
         .ok_or_else(|| unauthorized_response(state, "Authentication required"))?;
 

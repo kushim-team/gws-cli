@@ -342,8 +342,8 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
     // at least one role needs (principle of least privilege).
     let mut oauth_config = oauth_config;
     if let Some(pc) = &permissions_config {
-        let user_explicitly_set = matches.value_source("oauth-scopes")
-            == Some(clap::parser::ValueSource::CommandLine);
+        let user_explicitly_set =
+            matches.value_source("oauth-scopes") == Some(clap::parser::ValueSource::CommandLine);
         let union = pc.all_scopes_union();
         if !user_explicitly_set && !union.is_empty() {
             let mut scopes = vec![
@@ -1501,8 +1501,10 @@ mod tests {
         let cli = build_mcp_cli();
         let matches = cli.get_matches_from(vec![
             "mcp",
-            "--oauth-client-id", "test-id",
-            "--gateway-base-url", "https://gw.example.com",
+            "--oauth-client-id",
+            "test-id",
+            "--gateway-base-url",
+            "https://gw.example.com",
         ]);
         let mode = matches.get_one::<String>("tool-mode").unwrap();
         assert_eq!(mode, "full");
@@ -1514,9 +1516,12 @@ mod tests {
         let cli = build_mcp_cli();
         let matches = cli.get_matches_from(vec![
             "mcp",
-            "--oauth-client-id", "test-id",
-            "--gateway-base-url", "https://gw.example.com",
-            "--tool-mode", "compact",
+            "--oauth-client-id",
+            "test-id",
+            "--gateway-base-url",
+            "https://gw.example.com",
+            "--tool-mode",
+            "compact",
         ]);
         let mode = matches.get_one::<String>("tool-mode").unwrap();
         assert_eq!(mode, "compact");
