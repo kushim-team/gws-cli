@@ -19,6 +19,7 @@ mod http;
 mod jsonrpc;
 pub(crate) mod oauth;
 pub(crate) mod permissions;
+pub(crate) mod session_store;
 
 use crate::discovery::RestResource;
 use crate::error::GwsError;
@@ -129,6 +130,27 @@ fn build_mcp_cli() -> Command {
                 .value_parser(["compact", "full"])
                 .default_value("full")
                 .help("Tool granularity: 'compact' (1 tool/service + discover) or 'full' (1 tool/method)"),
+        )
+        .arg(
+            Arg::new("token-store-backend")
+                .long("token-store-backend")
+                .value_parser(["memory", "secret-manager"])
+                .default_value("memory")
+                .help("Token store backend: 'memory' (local dev) or 'secret-manager' (Cloud Run)")
+                .env("GWS_TOKEN_STORE_BACKEND"),
+        )
+        .arg(
+            Arg::new("secret-manager-project")
+                .long("secret-manager-project")
+                .help("GCP project ID for Secret Manager (required when backend=secret-manager)")
+                .env("GWS_SECRET_MANAGER_PROJECT"),
+        )
+        .arg(
+            Arg::new("secret-manager-secret")
+                .long("secret-manager-secret")
+                .help("Secret ID in Secret Manager (env: GWS_SECRET_MANAGER_SECRET)")
+                .env("GWS_SECRET_MANAGER_SECRET")
+                .default_value("gws-mcp-sessions"),
         )
 }
 
@@ -364,6 +386,38 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         }
     }
 
+    // Build session persistence backend.
+    let backend = matches
+        .get_one::<String>("token-store-backend")
+        .unwrap()
+        .as_str();
+    let persistence: Arc<dyn session_store::SessionPersistence> = match backend {
+        "secret-manager" => {
+            let project = matches
+                .get_one::<String>("secret-manager-project")
+                .ok_or_else(|| {
+                    GwsError::Validation(
+                        "--secret-manager-project is required when token-store-backend=secret-manager".to_string(),
+                    )
+                })?
+                .clone();
+            let secret_id = matches
+                .get_one::<String>("secret-manager-secret")
+                .unwrap()
+                .clone();
+            eprintln!(
+                "[gws mcp] Token store: Secret Manager (project={project}, secret={secret_id})"
+            );
+            Arc::new(session_store::SecretManagerPersistence::new(
+                project, secret_id,
+            ))
+        }
+        _ => {
+            eprintln!("[gws mcp] Token store: in-memory (sessions lost on restart)");
+            Arc::new(session_store::InMemoryPersistence)
+        }
+    };
+
     let port = *matches.get_one::<u16>("port").unwrap();
     let host = matches.get_one::<String>("host").unwrap().clone();
     let allow_origin = matches.get_one::<String>("allow-origin").unwrap().clone();
@@ -375,6 +429,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         &allow_origin,
         oauth_config,
         permissions_config,
+        persistence,
     )
     .await
 }

@@ -55,6 +55,9 @@ gws mcp -s all                    # expose all services (many tools!)
 | `-p, --port <port>`            | HTTP port (env: `PORT`, default: 8080)                 |
 | `--host <host>`                | Host address to bind (default: 127.0.0.1)              |
 | `--permissions-file <path>`    | Path to permissions YAML (env: `GWS_PERMISSIONS_FILE`) |
+| `--token-store-backend <mode>` | `memory` (default) or `secret-manager` (env: `GWS_TOKEN_STORE_BACKEND`) |
+| `--secret-manager-project <id>`| GCP project ID (env: `GWS_SECRET_MANAGER_PROJECT`)     |
+| `--secret-manager-secret <id>` | Secret ID (env: `GWS_SECRET_MANAGER_SECRET`, default: `gws-mcp-sessions`) |
 
 ### Permission Control (HTTP Gateway)
 
@@ -192,6 +195,40 @@ Method IDs follow the naming from Google's Discovery JSON (e.g. `drive.files.lis
 - **Unregistered users** (email not in `users:`) are denied all access — `tools/list` returns an empty list and `tools/call` returns a permission error.
 - **No permissions file** — all authenticated users have full access (backwards-compatible).
 - **Missing scopes or method in role** — the role denies all access. Both must be defined.
+
+### Token Store Backend
+
+The gateway supports two backends for persisting OAuth sessions (bearer tokens + Google refresh tokens):
+
+| Backend | Use case | Sessions survive restart? |
+|---------|----------|--------------------------|
+| `memory` (default) | Local development | No |
+| `secret-manager` | Cloud Run production | Yes |
+
+**Local development (in-memory):**
+
+```bash
+gws mcp -s drive \
+  --oauth-client-id $CLIENT_ID \
+  --gateway-base-url http://localhost:8080
+# Sessions are lost when the process exits
+```
+
+**Cloud Run (Secret Manager):**
+
+```bash
+gws mcp -s all \
+  --token-store-backend secret-manager \
+  --secret-manager-project my-gcp-project \
+  --secret-manager-secret gws-mcp-sessions \
+  --oauth-client-id $CLIENT_ID \
+  --gateway-base-url https://gw.example.com
+```
+
+The Secret Manager backend stores all sessions as a single JSON secret. On startup, persisted sessions are loaded into memory. On each session mutation (create, refresh, expire), the secret is updated.
+
+> [!NOTE]
+> The Cloud Run service account needs the `Secret Manager Admin` role (`roles/secretmanager.admin`) on the project, or `Secret Manager Secret Version Manager` on the specific secret. The secret is auto-created on first use if it doesn't exist.
 
 ## AI-DLC Development Cycle
 

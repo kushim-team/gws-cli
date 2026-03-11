@@ -102,6 +102,9 @@ jobs:
           env_vars: |
             RUST_LOG=info
             GWS_GATEWAY_BASE_URL=${{ steps.service-url.outputs.url }}
+            GWS_TOKEN_STORE_BACKEND=secret-manager
+            GWS_SECRET_MANAGER_PROJECT=${{ vars.GCP_PROJECT_ID }}
+            GWS_SECRET_MANAGER_SECRET=${{ vars.GWS_SESSION_SECRET_ID || 'gws-mcp-sessions' }}
           secrets: |
             GOOGLE_WORKSPACE_CLI_CLIENT_ID=gws-oauth-client-id:latest
             GOOGLE_WORKSPACE_CLI_CLIENT_SECRET=gws-oauth-client-secret:latest
