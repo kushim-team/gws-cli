@@ -770,6 +770,10 @@ async fn handle_token_authorization_code(
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
+    resp_headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
 
     let resp_body = json!({
         "access_token": bearer_token,
@@ -854,6 +858,10 @@ async fn handle_token_refresh(
     resp_headers.insert(
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
+    );
+    resp_headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
     );
 
     let resp_body = json!({
