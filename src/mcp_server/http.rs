@@ -11,10 +11,10 @@ use axum::Router;
 struct AppState {
     config: ServerConfig,
     tools_cache: Mutex<Option<Vec<Value>>>,
-    /// Maps session_id -> bearer_token (or empty string when OAuth is disabled).
+    /// Maps session_id -> bearer_token.
     sessions: Mutex<HashMap<String, String>>,
     allowed_origins: Vec<String>,
-    oauth_config: Option<OAuthConfig>,
+    oauth_config: OAuthConfig,
     token_store: Mutex<TokenStore>,
     permissions: Option<PermissionsConfig>,
 }
@@ -24,7 +24,7 @@ pub(super) async fn serve(
     host: &str,
     port: u16,
     allow_origin: &str,
-    oauth_config: Option<OAuthConfig>,
+    oauth_config: OAuthConfig,
     permissions: Option<PermissionsConfig>,
 ) -> Result<(), GwsError> {
     let allowed_origins: Vec<String> = if allow_origin.is_empty() {
@@ -105,24 +105,20 @@ fn validate_origin(headers: &HeaderMap, allowed_origins: &[String]) -> bool {
 async fn validate_session(
     headers: &HeaderMap,
     sessions: &Mutex<HashMap<String, String>>,
-    oauth_enabled: bool,
 ) -> Result<String, Response> {
     match get_session_id(headers) {
         Some(id) => {
             let sessions = sessions.lock().await;
             match sessions.get(&id) {
                 Some(bound_bearer) => {
-                    // When OAuth is enabled, verify the bearer token matches the one
-                    // that created this session.
-                    if oauth_enabled {
-                        let bearer = extract_bearer_token(headers).unwrap_or_default();
-                        if bearer != *bound_bearer {
-                            return Err((
-                                StatusCode::FORBIDDEN,
-                                "Bearer token does not match session owner",
-                            )
-                                .into_response());
-                        }
+                    // Verify the bearer token matches the one that created this session.
+                    let bearer = extract_bearer_token(headers).unwrap_or_default();
+                    if bearer != *bound_bearer {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            "Bearer token does not match session owner",
+                        )
+                            .into_response());
                     }
                     Ok(id)
                 }
@@ -145,15 +141,10 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Resolve the Google access token for the current request.
-/// If OAuth is configured, requires a valid bearer token and refreshes if needed.
-/// Returns `None` if OAuth is not configured (local mode).
-/// Returns `Err(Response)` with 401 if auth is required but missing/invalid.
+/// Requires a valid bearer token and refreshes if needed.
+/// Returns `Err(Response)` with 401 if auth is missing/invalid.
 fn www_authenticate_header(state: &AppState) -> String {
-    let base_url = state
-        .oauth_config
-        .as_ref()
-        .map(|c| c.base_url.as_str())
-        .unwrap_or("");
+    let base_url = &state.oauth_config.base_url;
     format!(
         "Bearer realm=\"mcp\", resource_metadata=\"{base_url}/.well-known/oauth-authorization-server\""
     )
@@ -169,20 +160,12 @@ fn unauthorized_response(state: &AppState, msg: &str) -> Response {
         .into_response()
 }
 
-async fn resolve_google_token(
-    headers: &HeaderMap,
-    state: &AppState,
-) -> Result<Option<String>, Response> {
-    let oauth_config = match &state.oauth_config {
-        Some(c) => c,
-        None => return Ok(None), // No OAuth → local mode
-    };
-
+async fn resolve_google_token(headers: &HeaderMap, state: &AppState) -> Result<String, Response> {
     let bearer = extract_bearer_token(headers)
         .ok_or_else(|| unauthorized_response(state, "Authentication required"))?;
 
-    match oauth::get_valid_google_token(oauth_config, &state.token_store, &bearer).await {
-        Ok(token) => Ok(Some(token)),
+    match oauth::get_valid_google_token(&state.oauth_config, &state.token_store, &bearer).await {
+        Ok(token) => Ok(token),
         Err(_) => Err(unauthorized_response(state, "Invalid or expired token")),
     }
 }
@@ -210,7 +193,7 @@ async fn handle_post(
         }
     }
 
-    // Resolve Google token (returns 401 if OAuth enabled but no valid bearer)
+    // Resolve Google token (returns 401 if no valid bearer)
     let google_token = match resolve_google_token(&headers, &state).await {
         Ok(t) => t,
         Err(resp) => return resp,
@@ -260,14 +243,12 @@ async fn handle_post(
         .any(|m| m.get("method").and_then(|v| v.as_str()) == Some("initialize"));
 
     if !has_initialize {
-        if let Err(resp) =
-            validate_session(&headers, &state.sessions, state.oauth_config.is_some()).await
-        {
+        if let Err(resp) = validate_session(&headers, &state.sessions).await {
             return resp;
         }
     }
 
-    // Extract bearer token for session binding (empty string when OAuth disabled).
+    // Extract bearer token for session binding.
     let bearer_for_binding = extract_bearer_token(&headers).unwrap_or_default();
 
     // Resolve user email from bearer token for permission checks and logging.
@@ -297,7 +278,7 @@ async fn handle_post(
                     &params,
                     &state.config,
                     &state.tools_cache,
-                    google_token.as_deref(),
+                    &google_token,
                     &perm_ctx,
                 )
                 .await;
@@ -311,7 +292,7 @@ async fn handle_post(
             &params,
             &state.config,
             &state.tools_cache,
-            google_token.as_deref(),
+            &google_token,
             &perm_ctx,
         )
         .await;
@@ -371,9 +352,7 @@ async fn handle_get(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
                 .into_response();
         }
     }
-    if let Err(resp) =
-        validate_session(&headers, &state.sessions, state.oauth_config.is_some()).await
-    {
+    if let Err(resp) = validate_session(&headers, &state.sessions).await {
         return resp;
     }
 
@@ -396,7 +375,7 @@ async fn handle_delete(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         return resp;
     }
     // Validate session exists and bearer matches owner.
-    match validate_session(&headers, &state.sessions, state.oauth_config.is_some()).await {
+    match validate_session(&headers, &state.sessions).await {
         Ok(id) => {
             let mut sessions = state.sessions.lock().await;
             sessions.remove(&id);
@@ -410,10 +389,7 @@ async fn handle_delete(State(state): State<Arc<AppState>>, headers: HeaderMap) -
 
 /// GET /.well-known/oauth-authorization-server
 async fn handle_oauth_metadata(State(state): State<Arc<AppState>>) -> Response {
-    let oauth_config = match &state.oauth_config {
-        Some(c) => c,
-        None => return (StatusCode::NOT_FOUND, "OAuth not configured").into_response(),
-    };
+    let oauth_config = &state.oauth_config;
     let base_url = &oauth_config.base_url;
 
     let scopes: Vec<&str> = oauth_config.scopes.split_whitespace().collect();
@@ -446,10 +422,7 @@ async fn handle_authorize(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let oauth_config = match &state.oauth_config {
-        Some(c) => c,
-        None => return (StatusCode::NOT_FOUND, "OAuth not configured").into_response(),
-    };
+    let oauth_config = &state.oauth_config;
 
     // Phase 1-2: client_id is required and must be registered.
     let client_id = match params.get("client_id") {
@@ -583,10 +556,7 @@ async fn handle_oauth_callback(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let oauth_config = match &state.oauth_config {
-        Some(c) => c,
-        None => return (StatusCode::NOT_FOUND, "OAuth not configured").into_response(),
-    };
+    let oauth_config = &state.oauth_config;
 
     let google_code = match params.get("code") {
         Some(c) => c.clone(),
@@ -688,10 +658,7 @@ async fn handle_token(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    let oauth_config = match &state.oauth_config {
-        Some(c) => c,
-        None => return (StatusCode::NOT_FOUND, "OAuth not configured").into_response(),
-    };
+    let oauth_config = &state.oauth_config;
 
     // CORS headers for /token
     let cors_headers = build_cors_headers(&headers, &state.allowed_origins);
@@ -914,10 +881,6 @@ async fn handle_register(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    if state.oauth_config.is_none() {
-        return (StatusCode::NOT_FOUND, "OAuth not configured").into_response();
-    }
-
     let cors_headers = build_cors_headers(&headers, &state.allowed_origins);
 
     #[derive(serde::Deserialize)]
@@ -1041,13 +1004,23 @@ mod tests {
     use tower::ServiceExt;
 
     const ACCEPT_MCP: &str = "application/json, text/event-stream";
+    const TEST_BEARER: &str = "test-bearer-token";
 
-    fn test_state() -> Arc<AppState> {
-        test_state_with_origins(vec![])
+    fn test_oauth_config() -> OAuthConfig {
+        OAuthConfig {
+            client_id: "test-client-id".to_string(),
+            client_secret: "test-secret".to_string(),
+            base_url: "https://gw.example.com".to_string(),
+            scopes: "openid email".to_string(),
+        }
     }
 
-    fn test_state_with_origins(allowed_origins: Vec<String>) -> Arc<AppState> {
-        Arc::new(AppState {
+    async fn test_state() -> Arc<AppState> {
+        test_state_with_origins(vec![]).await
+    }
+
+    async fn test_state_with_origins(allowed_origins: Vec<String>) -> Arc<AppState> {
+        let state = Arc::new(AppState {
             config: ServerConfig {
                 services: vec![],
                 workflows: false,
@@ -1057,32 +1030,22 @@ mod tests {
             tools_cache: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             allowed_origins,
-            oauth_config: None,
+            oauth_config: test_oauth_config(),
             token_store: Mutex::new(TokenStore::new()),
             permissions: None,
-        })
+        });
+        // Pre-register a bearer session for tests that need auth.
+        state
+            .token_store
+            .lock()
+            .await
+            .bearer_sessions
+            .insert(TEST_BEARER.to_string(), make_bearer_session());
+        state
     }
 
-    fn test_state_with_oauth() -> Arc<AppState> {
-        Arc::new(AppState {
-            config: ServerConfig {
-                services: vec![],
-                workflows: false,
-                _helpers: false,
-                tool_mode: ToolMode::Full,
-            },
-            tools_cache: Mutex::new(None),
-            sessions: Mutex::new(HashMap::new()),
-            allowed_origins: vec![],
-            oauth_config: Some(OAuthConfig {
-                client_id: "test-client-id".to_string(),
-                client_secret: "test-secret".to_string(),
-                base_url: "https://gw.example.com".to_string(),
-                scopes: "openid email".to_string(),
-            }),
-            token_store: Mutex::new(TokenStore::new()),
-            permissions: None,
-        })
+    async fn test_state_with_oauth() -> Arc<AppState> {
+        test_state().await
     }
 
     fn test_app(state: Arc<AppState>) -> Router {
@@ -1102,6 +1065,10 @@ mod tests {
     }
 
     async fn init_session(app: &Router) -> String {
+        init_session_with_bearer(app, TEST_BEARER).await
+    }
+
+    async fn init_session_with_bearer(app: &Router, bearer: &str) -> String {
         let init_body = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -1116,6 +1083,7 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", ACCEPT_MCP)
+                    .header("authorization", format!("Bearer {bearer}"))
                     .body(Body::from(serde_json::to_string(&init_body).unwrap()))
                     .unwrap(),
             )
@@ -1129,11 +1097,11 @@ mod tests {
             .to_string()
     }
 
-    // --- Existing MCP transport tests (no OAuth) ---
+    // --- MCP transport tests ---
 
     #[tokio::test]
     async fn test_initialize_returns_session_id() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
 
@@ -1144,6 +1112,7 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", ACCEPT_MCP)
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
             )
@@ -1159,7 +1128,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_list_requires_session() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
         let resp = app
@@ -1169,6 +1138,7 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", ACCEPT_MCP)
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
             )
@@ -1179,7 +1149,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_list_with_valid_session() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let session_id = init_session(&app).await;
         let body = json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
@@ -1190,6 +1160,7 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", ACCEPT_MCP)
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .header("mcp-session-id", &session_id)
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
@@ -1204,7 +1175,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_session() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let session_id = init_session(&app).await;
         let resp = app
@@ -1213,6 +1184,7 @@ mod tests {
                 Request::builder()
                     .method("DELETE")
                     .uri("/mcp")
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .header("mcp-session-id", &session_id)
                     .body(Body::empty())
                     .unwrap(),
@@ -1229,6 +1201,7 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", ACCEPT_MCP)
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .header("mcp-session-id", &session_id)
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
@@ -1240,7 +1213,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_returns_accepted() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let session_id = init_session(&app).await;
         let body = json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}});
@@ -1251,6 +1224,7 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", ACCEPT_MCP)
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .header("mcp-session-id", &session_id)
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
@@ -1262,7 +1236,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_error() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let resp = app
             .oneshot(
@@ -1271,6 +1245,7 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", ACCEPT_MCP)
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .body(Body::from("not valid json"))
                     .unwrap(),
             )
@@ -1284,13 +1259,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_without_session_header() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let resp = app
             .oneshot(
                 Request::builder()
                     .method("DELETE")
                     .uri("/mcp")
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1301,13 +1277,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_unknown_session() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let resp = app
             .oneshot(
                 Request::builder()
                     .method("DELETE")
                     .uri("/mcp")
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .header("mcp-session-id", "nonexistent")
                     .body(Body::empty())
                     .unwrap(),
@@ -1319,7 +1296,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_session_returns_not_found() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
         let resp = app
@@ -1329,6 +1306,7 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", ACCEPT_MCP)
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .header("mcp-session-id", "does-not-exist")
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
@@ -1340,7 +1318,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_request() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let session_id = init_session(&app).await;
         let batch = json!([
@@ -1354,6 +1332,7 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", ACCEPT_MCP)
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .header("mcp-session-id", &session_id)
                     .body(Body::from(serde_json::to_string(&batch).unwrap()))
                     .unwrap(),
@@ -1370,7 +1349,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_all_notifications_returns_accepted() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let session_id = init_session(&app).await;
         let batch = json!([{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}]);
@@ -1381,6 +1360,7 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", ACCEPT_MCP)
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .header("mcp-session-id", &session_id)
                     .body(Body::from(serde_json::to_string(&batch).unwrap()))
                     .unwrap(),
@@ -1392,7 +1372,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_origin_validation_rejects_bad_origin() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
         let resp = app
@@ -1402,6 +1382,7 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", ACCEPT_MCP)
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .header("origin", "https://evil.example.com")
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
@@ -1413,7 +1394,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_origin_validation_allows_localhost() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
         let resp = app
@@ -1423,6 +1404,7 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", ACCEPT_MCP)
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .header("origin", "http://localhost:3000")
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
@@ -1434,7 +1416,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_origin_validation_allows_configured_origin() {
-        let state = test_state_with_origins(vec!["https://my-app.example.com".to_string()]);
+        let state = test_state_with_origins(vec!["https://my-app.example.com".to_string()]).await;
         let app = test_app(state);
         let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
         let resp = app
@@ -1444,6 +1426,7 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", ACCEPT_MCP)
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .header("origin", "https://my-app.example.com")
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
@@ -1455,7 +1438,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_accept_header_missing_event_stream() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
         let resp = app
@@ -1465,6 +1448,7 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", "application/json")
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
             )
@@ -1475,7 +1459,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_requires_accept_event_stream() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let session_id = init_session(&app).await;
         let resp = app
@@ -1484,6 +1468,7 @@ mod tests {
                     .method("GET")
                     .uri("/mcp")
                     .header("accept", "application/json")
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .header("mcp-session-id", &session_id)
                     .body(Body::empty())
                     .unwrap(),
@@ -1495,7 +1480,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_invalid_session_returns_not_found() {
-        let state = test_state();
+        let state = test_state().await;
         let app = test_app(state);
         let resp = app
             .oneshot(
@@ -1503,6 +1488,7 @@ mod tests {
                     .method("GET")
                     .uri("/mcp")
                     .header("accept", "text/event-stream")
+                    .header("authorization", format!("Bearer {TEST_BEARER}"))
                     .header("mcp-session-id", "does-not-exist")
                     .body(Body::empty())
                     .unwrap(),
@@ -1568,7 +1554,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_oauth_metadata_returns_endpoints() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let app = test_app(state);
         let resp = app
             .oneshot(
@@ -1597,25 +1583,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_oauth_metadata_not_found_without_config() {
-        let state = test_state();
-        let app = test_app(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/.well-known/oauth-authorization-server")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
     async fn test_authorize_requires_client_id() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let app = test_app(state);
         let resp = app
             .oneshot(
@@ -1635,7 +1604,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_requires_pkce() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let app = test_app(state.clone());
         let client_id = register_client(&app, &["https://x.com/cb"]).await;
         let resp = app
@@ -1661,7 +1630,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_rejects_plain_pkce() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let app = test_app(state.clone());
         let client_id = register_client(&app, &["https://x.com/cb"]).await;
         let resp = app
@@ -1679,7 +1648,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_validates_redirect_uri() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let app = test_app(state.clone());
         let client_id = register_client(&app, &["https://registered.com/cb"]).await;
         // Try with unregistered redirect_uri
@@ -1698,7 +1667,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_redirects_to_google() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let app = test_app(state.clone());
         let client_id = register_client(&app, &["https://client.example.com/cb"]).await;
         let resp = app
@@ -1719,7 +1688,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_invalid_grant_type() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let app = test_app(state);
         let resp = app
             .oneshot(
@@ -1740,7 +1709,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_invalid_code() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let app = test_app(state);
         let resp = app
             .oneshot(
@@ -1763,7 +1732,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_exchange_with_pkce() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let challenge = {
             use sha2::Digest;
@@ -1808,7 +1777,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_exchange_expired_code() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let challenge = {
             use sha2::Digest;
@@ -1843,7 +1812,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_exchange_pkce_failure() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         {
             let mut store = state.token_store.lock().await;
             store.pending_codes.insert(
@@ -1873,7 +1842,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_returns_client_id() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let app = test_app(state);
         let body = json!({
             "client_name": "Claude",
@@ -1901,7 +1870,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_rejects_dangerous_redirect_uri() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let app = test_app(state);
         let body = json!({
             "client_name": "Evil",
@@ -1923,7 +1892,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_post_requires_auth_when_oauth_enabled() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let app = test_app(state);
         let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
         let resp = app
@@ -1953,7 +1922,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_post_with_valid_bearer_token() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         {
             let mut store = state.token_store.lock().await;
             store
@@ -1981,7 +1950,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_post_with_invalid_bearer_token() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let app = test_app(state);
         let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
         let resp = app
@@ -2002,7 +1971,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_mcp_requires_auth_when_oauth_enabled() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let app = test_app(state);
         let resp = app
             .oneshot(
@@ -2020,7 +1989,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_bearer_binding_rejects_wrong_bearer() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         // Register two bearer tokens.
         {
             let mut store = state.token_store.lock().await;
@@ -2096,7 +2065,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_mcp_requires_auth_when_oauth_enabled() {
-        let state = test_state_with_oauth();
+        let state = test_state_with_oauth().await;
         let app = test_app(state);
         let resp = app
             .oneshot(

@@ -28,5 +28,6 @@ EXPOSE 8080
 
 # Start MCP gateway in HTTP mode
 # PORT is set by Cloud Run (default 8080), read via clap env("PORT")
-# OAuth credentials should be provided via env vars or Secret Manager
+# OAuth credentials are required via env vars (set by Cloud Run / Secret Manager):
+#   GOOGLE_WORKSPACE_CLI_CLIENT_ID, GOOGLE_WORKSPACE_CLI_CLIENT_SECRET, GWS_GATEWAY_BASE_URL
 ENTRYPOINT ["gws", "mcp", "--host", "0.0.0.0", "--port", "8080", "-s", "all", "--permissions-file", "/app/config/permissions.yaml"]
