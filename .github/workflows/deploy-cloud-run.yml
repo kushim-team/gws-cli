@@ -133,9 +133,7 @@ jobs:
       - name: Health check
         run: |
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X POST "${SERVICE_URL}/mcp" \
-            -H "Content-Type: application/json" \
-            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci-healthcheck","version":"1.0"}}}')
+            "${SERVICE_URL}/.well-known/oauth-authorization-server")
           if [ "$STATUS" -ne 200 ]; then
             echo "::error::Health check failed with status ${STATUS}"
             exit 1
