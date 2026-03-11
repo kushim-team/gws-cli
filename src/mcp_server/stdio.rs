@@ -24,14 +24,16 @@ pub(super) async fn serve(config: ServerConfig) -> Result<(), GwsError> {
                 if is_notification {
                     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
                     let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-                    let _ = handle_request(method, &params, &config, &tools_cache, None, &perm_ctx).await;
+                    let _ = handle_request(method, &params, &config, &tools_cache, None, &perm_ctx)
+                        .await;
                     continue;
                 }
 
                 let id = req.get("id").unwrap().clone();
                 let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
                 let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-                let result = handle_request(method, &params, &config, &tools_cache, None, &perm_ctx).await;
+                let result =
+                    handle_request(method, &params, &config, &tools_cache, None, &perm_ctx).await;
                 build_jsonrpc_response(&id, result)
             }
             Err(_) => build_parse_error_response(),

@@ -231,7 +231,11 @@ pub async fn exchange_google_code(
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
         // Phase 3-5: Limit error log length.
-        let truncated = if body.len() > 500 { &body[..500] } else { &body };
+        let truncated = if body.len() > 500 {
+            &body[..500]
+        } else {
+            &body
+        };
         anyhow::bail!("Google token exchange failed: {truncated}");
     }
 
@@ -258,7 +262,11 @@ pub async fn refresh_google_token(
 
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
-        let truncated = if body.len() > 500 { &body[..500] } else { &body };
+        let truncated = if body.len() > 500 {
+            &body[..500]
+        } else {
+            &body
+        };
         anyhow::bail!("Google token refresh failed: {truncated}");
     }
 
@@ -298,7 +306,11 @@ pub async fn get_google_userinfo(access_token: &str) -> anyhow::Result<String> {
 
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
-        let truncated = if body.len() > 500 { &body[..500] } else { &body };
+        let truncated = if body.len() > 500 {
+            &body[..500]
+        } else {
+            &body
+        };
         anyhow::bail!("Google userinfo request failed: {truncated}");
     }
 
@@ -311,11 +323,7 @@ pub async fn get_google_userinfo(access_token: &str) -> anyhow::Result<String> {
 
 /// Validate a PKCE `code_verifier` against the stored `code_challenge`.
 /// Only S256 is supported; plain is rejected.
-pub fn validate_pkce(
-    code_verifier: &str,
-    code_challenge: &str,
-    method: Option<&str>,
-) -> bool {
+pub fn validate_pkce(code_verifier: &str, code_challenge: &str, method: Option<&str>) -> bool {
     match method.unwrap_or("S256") {
         "S256" => {
             let digest = sha2::Sha256::digest(code_verifier.as_bytes());
@@ -377,10 +385,7 @@ pub async fn get_valid_google_token(
 ///
 /// Returns `None` when the bearer token is not found in the store
 /// (e.g. OAuth is disabled or the session has expired).
-pub async fn get_email_for_bearer(
-    store: &Mutex<TokenStore>,
-    bearer_token: &str,
-) -> Option<String> {
+pub async fn get_email_for_bearer(store: &Mutex<TokenStore>, bearer_token: &str) -> Option<String> {
     let guard = store.lock().await;
     guard
         .bearer_sessions
@@ -390,17 +395,14 @@ pub async fn get_email_for_bearer(
 
 /// Build the Google OAuth authorization URL for the consent screen.
 pub fn build_google_auth_url(config: &OAuthConfig, state: &str) -> String {
-    let redirect_uri =
-        percent_encoding::utf8_percent_encode(
-            &format!("{}/oauth/callback", config.base_url),
-            percent_encoding::NON_ALPHANUMERIC,
-        )
-        .to_string();
-    let scope = percent_encoding::utf8_percent_encode(
-        &config.scopes,
+    let redirect_uri = percent_encoding::utf8_percent_encode(
+        &format!("{}/oauth/callback", config.base_url),
         percent_encoding::NON_ALPHANUMERIC,
     )
     .to_string();
+    let scope =
+        percent_encoding::utf8_percent_encode(&config.scopes, percent_encoding::NON_ALPHANUMERIC)
+            .to_string();
 
     format!(
         "https://accounts.google.com/o/oauth2/auth\
