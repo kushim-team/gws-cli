@@ -223,9 +223,11 @@ where
             .unwrap_or_default();
 
         // Build the top-level JSON object with flat structure.
-        write!(writer, "{{\"severity\":\"{severity}\",\"timestamp\":\"{timestamp}\",\"message\":")?;
-        serde_json::to_writer(WriterAdapter(&mut writer), &message)
-            .map_err(|_| std::fmt::Error)?;
+        write!(
+            writer,
+            "{{\"severity\":\"{severity}\",\"timestamp\":\"{timestamp}\",\"message\":"
+        )?;
+        serde_json::to_writer(WriterAdapter(&mut writer), &message).map_err(|_| std::fmt::Error)?;
 
         for (key, value) in &fields {
             write!(writer, ",\"{key}\":")?;
@@ -242,8 +244,10 @@ struct JsonFieldVisitor<'a>(&'a mut serde_json::Map<String, serde_json::Value>);
 
 impl tracing::field::Visit for JsonFieldVisitor<'_> {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        self.0
-            .insert(field.name().to_string(), serde_json::Value::String(value.to_string()));
+        self.0.insert(
+            field.name().to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
@@ -276,9 +280,7 @@ impl std::io::Write for WriterAdapter<'_, '_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let s = std::str::from_utf8(buf)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        self.0
-            .write_str(s)
-            .map_err(std::io::Error::other)?;
+        self.0.write_str(s).map_err(std::io::Error::other)?;
         Ok(buf.len())
     }
 
@@ -313,13 +315,8 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
     ) {
         (Some(client_id), Some(client_secret), Some(base_url)) => {
             let base_url = base_url.trim_end_matches('/').to_string();
-            oauth::validate_gateway_base_url(&base_url).map_err(|e| {
-                GwsError::Validation(e)
-            })?;
-            let scopes = matches
-                .get_one::<String>("oauth-scopes")
-                .unwrap()
-                .clone();
+            oauth::validate_gateway_base_url(&base_url).map_err(|e| GwsError::Validation(e))?;
+            let scopes = matches.get_one::<String>("oauth-scopes").unwrap().clone();
             eprintln!("[gws mcp] OAuth enabled for gateway auth");
             Some(oauth::OAuthConfig {
                 client_id: client_id.clone(),
@@ -339,8 +336,8 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
     // Load permissions config if specified.
     let permissions_config = match matches.get_one::<String>("permissions-file") {
         Some(path) => {
-            let pc = permissions::PermissionsConfig::load_from_file(path)
-                .map_err(GwsError::Other)?;
+            let pc =
+                permissions::PermissionsConfig::load_from_file(path).map_err(GwsError::Other)?;
             eprintln!("[gws mcp] Permissions loaded from {path}");
             Some(pc)
         }
@@ -357,14 +354,21 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
                 == Some(clap::parser::ValueSource::CommandLine);
             let union = pc.all_scopes_union();
             if !user_explicitly_set && !union.is_empty() {
-                let mut scopes = vec!["openid".to_string(), "email".to_string(), "profile".to_string()];
+                let mut scopes = vec![
+                    "openid".to_string(),
+                    "email".to_string(),
+                    "profile".to_string(),
+                ];
                 for s in union {
                     if !scopes.contains(&s) {
                         scopes.push(s);
                     }
                 }
                 oc.scopes = scopes.join(" ");
-                eprintln!("[gws mcp] OAuth scopes narrowed to permissions union: {}", oc.scopes);
+                eprintln!(
+                    "[gws mcp] OAuth scopes narrowed to permissions union: {}",
+                    oc.scopes
+                );
             }
             Some(oc)
         }
@@ -373,12 +377,17 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
 
     let port = *matches.get_one::<u16>("port").unwrap();
     let host = matches.get_one::<String>("host").unwrap().clone();
-    let allow_origin = matches
-        .get_one::<String>("allow-origin")
-        .unwrap()
-        .clone();
+    let allow_origin = matches.get_one::<String>("allow-origin").unwrap().clone();
     eprintln!("[gws mcp] Starting HTTP transport on {host}:{port}");
-    http::serve(config, &host, port, &allow_origin, oauth_config, permissions_config).await
+    http::serve(
+        config,
+        &host,
+        port,
+        &allow_origin,
+        oauth_config,
+        permissions_config,
+    )
+    .await
 }
 
 // --- Shared request handler ---
@@ -952,7 +961,8 @@ async fn handle_tools_call(
             ))
         })?;
 
-        return execute_mcp_method(&doc, method, arguments, access_token, perm_ctx, tool_name).await;
+        return execute_mcp_method(&doc, method, arguments, access_token, perm_ctx, tool_name)
+            .await;
     }
 
     // Full mode: tool_name encodes service_resource_method (e.g., drive_files_list)

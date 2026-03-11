@@ -138,7 +138,10 @@ impl PermissionsConfig {
         if role_def.method.is_empty() {
             return false;
         }
-        role_def.method.iter().any(|p| matches_pattern(p, method_id))
+        role_def
+            .method
+            .iter()
+            .any(|p| matches_pattern(p, method_id))
     }
 
     /// Return the union of all scopes across every role.
@@ -161,11 +164,7 @@ impl PermissionsConfig {
     /// Filter a list of method IDs to only those allowed for the given user.
     /// Returns an empty vec for unregistered users.
     #[cfg(test)]
-    pub fn filter_allowed_methods<'a>(
-        &self,
-        email: &str,
-        method_ids: &[&'a str],
-    ) -> Vec<&'a str> {
+    pub fn filter_allowed_methods<'a>(&self, email: &str, method_ids: &[&'a str]) -> Vec<&'a str> {
         match self.get_allowed_patterns(email) {
             Some(patterns) => method_ids
                 .iter()
@@ -243,10 +242,7 @@ pub(super) fn filter_tools_by_permissions<'a>(
     tools
         .iter()
         .filter(|tool| {
-            let tool_name = tool
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or("");
+            let tool_name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let method_id = tool_name_to_method_id(tool_name);
 
             // Scope check.
@@ -270,7 +266,10 @@ pub(super) fn filter_tools_by_permissions<'a>(
             }
 
             // Method-pattern check.
-            role_def.method.iter().any(|p| matches_pattern(p, &method_id))
+            role_def
+                .method
+                .iter()
+                .any(|p| matches_pattern(p, &method_id))
         })
         .collect()
 }
@@ -481,7 +480,10 @@ users: {}
 
     #[test]
     fn test_tool_name_to_method_id() {
-        assert_eq!(tool_name_to_method_id("drive_files_list"), "drive.files.list");
+        assert_eq!(
+            tool_name_to_method_id("drive_files_list"),
+            "drive.files.list"
+        );
         assert_eq!(
             tool_name_to_method_id("gmail_users_messages_send"),
             "gmail.users.messages.send"
@@ -510,9 +512,7 @@ users: {}
     #[test]
     fn test_filter_tools_unregistered_user() {
         use serde_json::json;
-        let tools = vec![
-            json!({"name": "drive_files_list", "description": "List files"}),
-        ];
+        let tools = vec![json!({"name": "drive_files_list", "description": "List files"})];
         let perms = PermissionsConfig::parse(
             "roles:\n  admin:\n    scopes:\n      - \"https://www.googleapis.com/auth/drive\"\n    method:\n      - \"*\"\nusers:\n  admin@co.com:\n    role: admin\n",
         )
@@ -608,9 +608,7 @@ users:
     #[test]
     fn test_filter_tools_local_mode_no_email() {
         use serde_json::json;
-        let tools = vec![
-            json!({"name": "drive_files_list", "description": "List files"}),
-        ];
+        let tools = vec![json!({"name": "drive_files_list", "description": "List files"})];
         let perms = PermissionsConfig::parse(
             "roles:\n  admin:\n    scopes:\n      - \"https://www.googleapis.com/auth/drive\"\n    method:\n      - \"*\"\nusers:\n  admin@co.com:\n    role: admin\n",
         )
@@ -687,8 +685,10 @@ users:
         assert!(config.is_method_allowed_with_scopes(
             "user@co.com",
             "drive.files.list",
-            &["https://www.googleapis.com/auth/drive".to_string(),
-              "https://www.googleapis.com/auth/drive.readonly".to_string()],
+            &[
+                "https://www.googleapis.com/auth/drive".to_string(),
+                "https://www.googleapis.com/auth/drive.readonly".to_string()
+            ],
         ));
     }
 
@@ -732,11 +732,15 @@ users:
         let drive_scopes = vec!["https://www.googleapis.com/auth/drive".to_string()];
         // Scope matches AND method matches → allowed
         assert!(config.is_method_allowed_with_scopes(
-            "user@co.com", "drive.files.list", &drive_scopes,
+            "user@co.com",
+            "drive.files.list",
+            &drive_scopes,
         ));
         // Scope matches BUT method doesn't match → denied
         assert!(!config.is_method_allowed_with_scopes(
-            "user@co.com", "drive.files.create", &drive_scopes,
+            "user@co.com",
+            "drive.files.create",
+            &drive_scopes,
         ));
     }
 
@@ -920,11 +924,15 @@ users:
         let drive_scopes = vec!["https://www.googleapis.com/auth/drive".to_string()];
         // scopes-only role: denied because no method patterns
         assert!(!config.is_method_allowed_with_scopes(
-            "s@co.com", "drive.files.list", &drive_scopes,
+            "s@co.com",
+            "drive.files.list",
+            &drive_scopes,
         ));
         // method-only role: denied because no scopes
         assert!(!config.is_method_allowed_with_scopes(
-            "m@co.com", "drive.files.list", &drive_scopes,
+            "m@co.com",
+            "drive.files.list",
+            &drive_scopes,
         ));
     }
 }

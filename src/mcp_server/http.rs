@@ -126,14 +126,12 @@ async fn validate_session(
                     }
                     Ok(id)
                 }
-                None => Err(
-                    (StatusCode::NOT_FOUND, "Session not found or expired").into_response()
-                ),
+                None => {
+                    Err((StatusCode::NOT_FOUND, "Session not found or expired").into_response())
+                }
             }
         }
-        None => {
-            Err((StatusCode::BAD_REQUEST, "Missing Mcp-Session-Id header").into_response())
-        }
+        None => Err((StatusCode::BAD_REQUEST, "Missing Mcp-Session-Id header").into_response()),
     }
 }
 
@@ -356,10 +354,7 @@ async fn handle_post(
     (StatusCode::OK, resp_headers, body_str).into_response()
 }
 
-async fn handle_get(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn handle_get(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !validate_origin(&headers, &state.allowed_origins) {
         return (StatusCode::FORBIDDEN, "Invalid Origin").into_response();
     }
@@ -392,10 +387,7 @@ async fn handle_get(
         .unwrap()
 }
 
-async fn handle_delete(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn handle_delete(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !validate_origin(&headers, &state.allowed_origins) {
         return (StatusCode::FORBIDDEN, "Invalid Origin").into_response();
     }
@@ -463,7 +455,11 @@ async fn handle_authorize(
     let client_id = match params.get("client_id") {
         Some(id) => id.clone(),
         None => {
-            return oauth_error_response(StatusCode::BAD_REQUEST, "invalid_request", "Missing client_id");
+            return oauth_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Missing client_id",
+            );
         }
     };
     {
@@ -471,7 +467,11 @@ async fn handle_authorize(
         let client = match store.registered_clients.get(&client_id) {
             Some(c) => c.clone(),
             None => {
-                return oauth_error_response(StatusCode::BAD_REQUEST, "invalid_client", "Unknown client_id");
+                return oauth_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_client",
+                    "Unknown client_id",
+                );
             }
         };
 
@@ -479,10 +479,18 @@ async fn handle_authorize(
         let redirect_uri_param = params.get("redirect_uri");
         match redirect_uri_param {
             Some(uri) if !client.redirect_uris.contains(uri) => {
-                return oauth_error_response(StatusCode::BAD_REQUEST, "invalid_request", "redirect_uri not registered for this client");
+                return oauth_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "redirect_uri not registered for this client",
+                );
             }
             None if client.redirect_uris.is_empty() => {
-                return oauth_error_response(StatusCode::BAD_REQUEST, "invalid_request", "Missing redirect_uri and no default registered");
+                return oauth_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "Missing redirect_uri and no default registered",
+                );
             }
             _ => {}
         }
@@ -501,7 +509,11 @@ async fn handle_authorize(
     let code_challenge = match params.get("code_challenge") {
         Some(c) => c.clone(),
         None => {
-            return oauth_error_response(StatusCode::BAD_REQUEST, "invalid_request", "code_challenge is required (PKCE)");
+            return oauth_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "code_challenge is required (PKCE)",
+            );
         }
     };
     let code_challenge_method = params
@@ -509,7 +521,11 @@ async fn handle_authorize(
         .cloned()
         .unwrap_or_else(|| "S256".to_string());
     if code_challenge_method != "S256" {
-        return oauth_error_response(StatusCode::BAD_REQUEST, "invalid_request", "Only S256 code_challenge_method is supported");
+        return oauth_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Only S256 code_challenge_method is supported",
+        );
     }
 
     let client_state = params.get("state").cloned();
@@ -522,7 +538,11 @@ async fn handle_authorize(
         // Phase 2-11: cleanup and check capacity.
         store.cleanup_expired();
         if store.is_pending_auths_full() {
-            return oauth_error_response(StatusCode::SERVICE_UNAVAILABLE, "server_error", "Too many pending authorizations");
+            return oauth_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "Too many pending authorizations",
+            );
         }
         store.pending_auths.insert(
             our_state.clone(),
@@ -572,11 +592,7 @@ async fn handle_oauth_callback(
         Some(c) => c.clone(),
         None => {
             let error = params.get("error").map(|s| s.as_str()).unwrap_or("unknown");
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("OAuth error: {error}"),
-            )
-                .into_response();
+            return (StatusCode::BAD_REQUEST, format!("OAuth error: {error}")).into_response();
         }
     };
 
@@ -599,9 +615,7 @@ async fn handle_oauth_callback(
             }
             p
         }
-        None => {
-            return (StatusCode::BAD_REQUEST, "Unknown or expired state").into_response()
-        }
+        None => return (StatusCode::BAD_REQUEST, "Unknown or expired state").into_response(),
     };
 
     // Exchange Google code for tokens.
@@ -609,11 +623,7 @@ async fn handle_oauth_callback(
         Ok(t) => t,
         Err(e) => {
             eprintln!("[gws mcp] Google token exchange failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Token exchange failed",
-            )
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Token exchange failed").into_response();
         }
     };
 
@@ -622,11 +632,7 @@ async fn handle_oauth_callback(
         Ok(e) => e,
         Err(e) => {
             eprintln!("[gws mcp] Failed to get userinfo: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to identify user",
-            )
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to identify user").into_response();
         }
     };
 
@@ -646,7 +652,8 @@ async fn handle_oauth_callback(
                 session: oauth::UserSession {
                     email,
                     google_tokens,
-                    bearer_expires_at: chrono::Utc::now().timestamp() + oauth::BEARER_TOKEN_LIFETIME_SECS,
+                    bearer_expires_at: chrono::Utc::now().timestamp()
+                        + oauth::BEARER_TOKEN_LIFETIME_SECS,
                 },
                 code_challenge: pending.code_challenge,
                 code_challenge_method: pending.code_challenge_method,
@@ -658,18 +665,13 @@ async fn handle_oauth_callback(
     // Redirect back to the client with our auth code (url-encoded).
     let mut redirect = pending.client_redirect_uri;
     let sep = if redirect.contains('?') { "&" } else { "?" };
-    let encoded_code = percent_encoding::utf8_percent_encode(
-        &our_code,
-        percent_encoding::NON_ALPHANUMERIC,
-    );
+    let encoded_code =
+        percent_encoding::utf8_percent_encode(&our_code, percent_encoding::NON_ALPHANUMERIC);
     redirect.push_str(&format!("{sep}code={encoded_code}"));
     if let Some(cs) = &pending.client_state {
         redirect.push_str(&format!(
             "&state={}",
-            percent_encoding::utf8_percent_encode(
-                cs,
-                percent_encoding::NON_ALPHANUMERIC,
-            )
+            percent_encoding::utf8_percent_encode(cs, percent_encoding::NON_ALPHANUMERIC,)
         ));
     }
 
@@ -695,8 +697,7 @@ async fn handle_token(
     let cors_headers = build_cors_headers(&headers, &state.allowed_origins);
 
     // Parse form-encoded body.
-    let params: HashMap<String, String> =
-        serde_urlencoded::from_str(&body).unwrap_or_default();
+    let params: HashMap<String, String> = serde_urlencoded::from_str(&body).unwrap_or_default();
 
     let grant_type = params.get("grant_type").map(|s| s.as_str()).unwrap_or("");
 
@@ -704,9 +705,7 @@ async fn handle_token(
         "authorization_code" => {
             handle_token_authorization_code(&state, &params, cors_headers).await
         }
-        "refresh_token" => {
-            handle_token_refresh(&state, oauth_config, &params, cors_headers).await
-        }
+        "refresh_token" => handle_token_refresh(&state, oauth_config, &params, cors_headers).await,
         _ => {
             let mut resp_headers = cors_headers;
             resp_headers.insert(
@@ -745,12 +744,20 @@ async fn handle_token_authorization_code(
         Some(pc) => {
             // Phase 2-1: auth code TTL check (10 minutes).
             if chrono::Utc::now().timestamp() - pc.created_at > oauth::AUTH_CODE_TTL_SECS {
-                return token_error_response("invalid_grant", "Authorization code expired", cors_headers);
+                return token_error_response(
+                    "invalid_grant",
+                    "Authorization code expired",
+                    cors_headers,
+                );
             }
             pc
         }
         None => {
-            return token_error_response("invalid_grant", "Invalid authorization code", cors_headers);
+            return token_error_response(
+                "invalid_grant",
+                "Invalid authorization code",
+                cors_headers,
+            );
         }
     };
 
@@ -834,13 +841,21 @@ async fn handle_token_refresh(
         let rt = match &session.google_tokens.refresh_token {
             Some(rt) => rt.clone(),
             None => {
-                return token_error_response("invalid_grant", "No Google refresh token available", cors_headers);
+                return token_error_response(
+                    "invalid_grant",
+                    "No Google refresh token available",
+                    cors_headers,
+                );
             }
         };
         match oauth::refresh_google_token(oauth_config, &rt).await {
             Ok(new_tokens) => session.google_tokens = new_tokens,
             Err(_) => {
-                return token_error_response("invalid_grant", "Failed to refresh Google token", cors_headers);
+                return token_error_response(
+                    "invalid_grant",
+                    "Failed to refresh Google token",
+                    cors_headers,
+                );
             }
         }
     }
@@ -919,9 +934,7 @@ async fn handle_register(
 
     let req: RegistrationRequest = match serde_json::from_str(&body) {
         Ok(r) => r,
-        Err(_) => {
-            return (StatusCode::BAD_REQUEST, "Invalid registration request").into_response()
-        }
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid registration request").into_response(),
     };
 
     // Phase 2-3: validate redirect_uri schemes.
@@ -953,11 +966,13 @@ async fn handle_register(
     {
         let mut store = state.token_store.lock().await;
         if store.is_registered_clients_full() {
-            return (StatusCode::SERVICE_UNAVAILABLE, "Too many registered clients").into_response();
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Too many registered clients",
+            )
+                .into_response();
         }
-        store
-            .registered_clients
-            .insert(client_id.clone(), client);
+        store.registered_clients.insert(client_id.clone(), client);
     }
 
     let mut resp_headers = cors_headers;
@@ -1358,8 +1373,7 @@ mod tests {
         let state = test_state();
         let app = test_app(state);
         let session_id = init_session(&app).await;
-        let batch =
-            json!([{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}]);
+        let batch = json!([{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}]);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1420,8 +1434,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_origin_validation_allows_configured_origin() {
-        let state =
-            test_state_with_origins(vec!["https://my-app.example.com".to_string()]);
+        let state = test_state_with_origins(vec!["https://my-app.example.com".to_string()]);
         let app = test_app(state);
         let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
         let resp = app
@@ -1571,7 +1584,10 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let meta: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(meta["issuer"], "https://gw.example.com");
-        assert_eq!(meta["authorization_endpoint"], "https://gw.example.com/authorize");
+        assert_eq!(
+            meta["authorization_endpoint"],
+            "https://gw.example.com/authorize"
+        );
         assert_eq!(meta["token_endpoint"], "https://gw.example.com/token");
         // Phase 3-1: scopes_supported
         assert!(meta["scopes_supported"].is_array());
@@ -1626,7 +1642,9 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri(&format!("/authorize?client_id={client_id}&redirect_uri=https://x.com/cb"))
+                    .uri(&format!(
+                        "/authorize?client_id={client_id}&redirect_uri=https://x.com/cb"
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1635,7 +1653,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(body["error_description"].as_str().unwrap().contains("code_challenge"));
+        assert!(body["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("code_challenge"));
     }
 
     #[tokio::test]
@@ -1727,7 +1748,9 @@ mod tests {
                     .method("POST")
                     .uri("/token")
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("grant_type=authorization_code&code=bogus&code_verifier=x"))
+                    .body(Body::from(
+                        "grant_type=authorization_code&code=bogus&code_verifier=x",
+                    ))
                     .unwrap(),
             )
             .await
@@ -1750,11 +1773,14 @@ mod tests {
 
         {
             let mut store = state.token_store.lock().await;
-            store.pending_codes.insert("test-code".to_string(), make_pending_code(challenge));
+            store
+                .pending_codes
+                .insert("test-code".to_string(), make_pending_code(challenge));
         }
 
         let app = test_app(state.clone());
-        let body_str = format!("grant_type=authorization_code&code=test-code&code_verifier={verifier}");
+        let body_str =
+            format!("grant_type=authorization_code&code=test-code&code_verifier={verifier}");
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1802,7 +1828,9 @@ mod tests {
                     .method("POST")
                     .uri("/token")
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from(format!("grant_type=authorization_code&code=expired-code&code_verifier={verifier}")))
+                    .body(Body::from(format!(
+                        "grant_type=authorization_code&code=expired-code&code_verifier={verifier}"
+                    )))
                     .unwrap(),
             )
             .await
@@ -1830,7 +1858,9 @@ mod tests {
                     .method("POST")
                     .uri("/token")
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("grant_type=authorization_code&code=code2&code_verifier=wrong"))
+                    .body(Body::from(
+                        "grant_type=authorization_code&code=code2&code_verifier=wrong",
+                    ))
                     .unwrap(),
             )
             .await
@@ -1912,7 +1942,12 @@ mod tests {
         // Phase 2-6: WWW-Authenticate header present on 401
         assert!(resp.headers().get("www-authenticate").is_some());
         // Phase 2-5: absolute URL in resource_metadata
-        let www_auth = resp.headers().get("www-authenticate").unwrap().to_str().unwrap();
+        let www_auth = resp
+            .headers()
+            .get("www-authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(www_auth.contains("https://gw.example.com/.well-known/oauth-authorization-server"));
     }
 
@@ -1921,7 +1956,9 @@ mod tests {
         let state = test_state_with_oauth();
         {
             let mut store = state.token_store.lock().await;
-            store.bearer_sessions.insert("valid-bearer".to_string(), make_bearer_session());
+            store
+                .bearer_sessions
+                .insert("valid-bearer".to_string(), make_bearer_session());
         }
         let app = test_app(state);
         let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
@@ -2021,8 +2058,7 @@ mod tests {
 
         // bearer-b should be FORBIDDEN from using bearer-a's session.
         let app = test_app(state.clone());
-        let body2 =
-            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
+        let body2 = json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
         let resp = app
             .oneshot(
                 Request::builder()
