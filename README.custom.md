@@ -35,25 +35,12 @@ When syncing with a new upstream version, reset `N` to 1 (e.g. `0.10.0-hodl1.1`)
 
 ## MCP Server
 
-`gws mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io) server over stdio, exposing Google Workspace APIs as structured tools that any MCP-compatible client (Claude Desktop, Gemini CLI, VS Code, etc.) can call.
+`gws mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io) server over HTTP (Streamable HTTP transport), exposing Google Workspace APIs as structured tools that any MCP-compatible client can call.
 
 ```bash
-gws mcp -s drive                  # expose Drive tools
+gws mcp -s drive                  # expose Drive tools on port 8080
 gws mcp -s drive,gmail,calendar   # expose multiple services
 gws mcp -s all                    # expose all services (many tools!)
-```
-
-Configure in your MCP client:
-
-```json
-{
-  "mcpServers": {
-    "gws": {
-      "command": "gws",
-      "args": ["mcp", "-s", "drive,gmail,calendar"]
-    }
-  }
-}
 ```
 
 > [!TIP]
@@ -65,6 +52,8 @@ Configure in your MCP client:
 | `-s, --services <list>`        | Comma-separated services to expose, or `all`           |
 | `-w, --workflows`              | Also expose workflow tools                             |
 | `-e, --helpers`                | Also expose helper tools                               |
+| `-p, --port <port>`            | HTTP port (env: `PORT`, default: 8080)                 |
+| `--host <host>`                | Host address to bind (default: 127.0.0.1)              |
 | `--permissions-file <path>`    | Path to permissions YAML (env: `GWS_PERMISSIONS_FILE`) |
 
 ### Permission Control (HTTP Gateway)
@@ -77,7 +66,7 @@ When running in HTTP transport mode as a multi-user gateway, you can restrict ac
 A request is permitted only when it passes **both** checks. Roles must define both `scopes` and `method`; if either is empty the role denies all access.
 
 ```bash
-gws mcp -s all -t http \
+gws mcp -s all \
   --oauth-client-id $CLIENT_ID \
   --gateway-base-url https://gw.example.com \
   --permissions-file config/permissions.yaml
@@ -150,10 +139,10 @@ You can override this by explicitly setting `--oauth-scopes`:
 
 ```bash
 # Auto-narrowed from permissions (recommended)
-gws mcp -s all -t http --permissions-file config/permissions.yaml ...
+gws mcp -s all --permissions-file config/permissions.yaml ...
 
 # Manual override (ignores permissions scopes)
-gws mcp -s all -t http --oauth-scopes "openid email profile https://www.googleapis.com/auth/drive" ...
+gws mcp -s all --oauth-scopes "openid email profile https://www.googleapis.com/auth/drive" ...
 ```
 
 > [!IMPORTANT]
@@ -199,7 +188,7 @@ Method IDs follow the naming from Google's Discovery JSON (e.g. `drive.files.lis
 
 #### Behavior
 
-- **HTTP mode only** — OAuth authentication and permission control are only supported in HTTP transport mode (`-t http`). In stdio mode these options are ignored (a warning is printed).
+- **HTTP only** — The MCP server uses HTTP transport exclusively. OAuth authentication and permission control are supported.
 - **Unregistered users** (email not in `users:`) are denied all access — `tools/list` returns an empty list and `tools/call` returns a permission error.
 - **No permissions file** — all authenticated users have full access (backwards-compatible).
 - **Missing scopes or method in role** — the role denies all access. Both must be defined.

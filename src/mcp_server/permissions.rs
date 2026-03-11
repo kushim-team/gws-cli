@@ -198,7 +198,7 @@ pub fn matches_pattern(pattern: &str, method_id: &str) -> bool {
 
 /// Permission context for the current request.
 pub(super) struct PermissionContext<'a> {
-    /// User email (None in local/stdio mode).
+    /// User email (None when OAuth is not configured).
     pub user_email: Option<&'a str>,
     /// Permissions config (None if no permissions file loaded).
     pub permissions: Option<&'a PermissionsConfig>,
