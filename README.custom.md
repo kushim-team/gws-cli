@@ -230,6 +230,35 @@ The Secret Manager backend stores all sessions as a single JSON secret. On start
 > [!NOTE]
 > The Cloud Run service account needs the `Secret Manager Admin` role (`roles/secretmanager.admin`) on the project, or `Secret Manager Secret Version Manager` on the specific secret. The secret is auto-created on first use if it doesn't exist.
 
+## MCP Authorization Specification Compliance
+
+The MCP Gateway's OAuth implementation follows the [MCP Authorization Specification (2025-03-26)](https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization), which is based on:
+
+- [OAuth 2.1 IETF DRAFT](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-12)
+- [OAuth 2.0 Authorization Server Metadata (RFC 8414)](https://datatracker.ietf.org/doc/html/rfc8414)
+- [OAuth 2.0 Dynamic Client Registration Protocol (RFC 7591)](https://datatracker.ietf.org/doc/html/rfc7591)
+
+Claude Code / Claude Desktop act as MCP clients connecting to this server. Relevant client-side behavior is documented at:
+
+- [Claude Code — Connect to tools via MCP](https://code.claude.com/docs/en/mcp)
+- [MCP — Connect to remote MCP Servers](https://modelcontextprotocol.io/docs/develop/connect-remote-servers)
+
+### Key spec requirements affecting this implementation
+
+| Requirement | MCP Spec Level | How this gateway complies |
+|---|---|---|
+| OAuth 2.1 with PKCE | **MUST** | PKCE S256 enforced, `plain` rejected |
+| Authorization Server Metadata (RFC 8414) | **SHOULD** (server) / **MUST** (client) | `/.well-known/oauth-authorization-server` endpoint served; fallback paths also supported |
+| Dynamic Client Registration (RFC 7591) | **SHOULD** | `POST /register` implemented (unauthenticated, per RFC 7591) |
+| Fallback endpoint paths (`/authorize`, `/token`, `/register`) | **MUST** (if no metadata) | All three default paths are served |
+| Redirect URIs: localhost or HTTPS only | **MUST** | `validate_redirect_uri()` enforces this exact rule |
+| Bearer token in `Authorization` header | **MUST** | All MCP endpoints require `Authorization: Bearer <token>` |
+| HTTP 401 for missing/invalid auth | **MUST** | Implemented with `WWW-Authenticate` header |
+| Third-Party Authorization Flow | **MAY** | Gateway acts as OAuth AS (to Claude) + OAuth client (to Google), per spec's "Third-Party Authorization Flow" |
+
+> [!NOTE]
+> Some design choices that may appear unusual (e.g., unauthenticated `/register`, accepting any HTTPS URL as `redirect_uri`) are **required by the MCP specification** for interoperability with MCP clients such as Claude Code and Claude Desktop. See [security-analysis/](security-analysis/) for details on how these spec-mandated behaviors affect the threat model.
+
 ## AI-DLC Development Cycle
 
 This project (HODL1 fork) follows the [AI-DLC (AI-Driven Development Life Cycle)](https://aws.amazon.com/jp/blogs/devops/ai-driven-development-life-cycle/) methodology.
