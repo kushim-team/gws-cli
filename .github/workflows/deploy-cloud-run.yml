@@ -99,6 +99,7 @@ jobs:
             --concurrency=80
             --timeout=300s
             --allow-unauthenticated
+            --service-account=gws-mcp-runtime@${{ vars.GCP_PROJECT_ID }}.iam.gserviceaccount.com
           env_vars: |
             RUST_LOG=info
             GWS_GATEWAY_BASE_URL=${{ steps.service-url.outputs.url }}

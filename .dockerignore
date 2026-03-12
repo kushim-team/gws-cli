@@ -9,3 +9,4 @@ specs/
 *.tape
 *.md
 !README.md
+.env
