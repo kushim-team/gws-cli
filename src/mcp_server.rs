@@ -1169,18 +1169,44 @@ async fn execute_mcp_method(
 
     let result = result?;
 
-    let text_content = match result {
-        Some(val) => serde_json::to_string_pretty(&val).unwrap_or_else(|_| "[]".to_string()),
-        None => "Execution completed with no output.".to_string(),
+    let content = match result {
+        Some(ref val) if val.get("data_base64").is_some() => {
+            let mime = val
+                .get("mimeType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("application/octet-stream");
+            let data = val
+                .get("data_base64")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let bytes = val.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+
+            json!([
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": format!("data:{};base64,", mime),
+                        "mimeType": mime,
+                        "blob": data
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": format!("Binary file downloaded ({} bytes, {})", bytes, mime)
+                }
+            ])
+        }
+        Some(val) => {
+            let text = serde_json::to_string_pretty(&val).unwrap_or_else(|_| "[]".to_string());
+            json!([{ "type": "text", "text": text }])
+        }
+        None => {
+            json!([{ "type": "text", "text": "Execution completed with no output." }])
+        }
     };
 
     Ok(json!({
-        "content": [
-            {
-                "type": "text",
-                "text": text_content
-            }
-        ],
+        "content": content,
         "isError": false
     }))
 }

@@ -299,7 +299,12 @@ async fn handle_json_response(
     Ok(false)
 }
 
-/// Handle a binary response by streaming it to a file.
+/// Handle a binary response by streaming it to a file or returning base64.
+///
+/// When `capture_output` is true and no `output_path` is given (MCP mode),
+/// the response bytes are returned as base64-encoded data instead of being
+/// written to a local file. This allows MCP clients to receive the actual
+/// file content rather than just metadata about a local file they cannot access.
 async fn handle_binary_response(
     response: reqwest::Response,
     content_type: &str,
@@ -307,6 +312,26 @@ async fn handle_binary_response(
     output_format: &crate::formatter::OutputFormat,
     capture_output: bool,
 ) -> Result<Option<Value>, GwsError> {
+    // MCP mode: return bytes as base64 instead of writing to disk
+    if capture_output && output_path.is_none() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let bytes = response
+            .bytes()
+            .await
+            .context("Failed to read response bytes")?;
+        let total_bytes = bytes.len() as u64;
+        let data_base64 = STANDARD.encode(&bytes);
+
+        let result = json!({
+            "status": "success",
+            "mimeType": content_type,
+            "bytes": total_bytes,
+            "data_base64": data_base64,
+        });
+        return Ok(Some(result));
+    }
+
     let file_path = if let Some(p) = output_path {
         PathBuf::from(p)
     } else {
