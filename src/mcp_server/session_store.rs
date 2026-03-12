@@ -4,6 +4,15 @@
 //! refresh tokens) and two implementations:
 //! - `InMemoryPersistence`: no-op, sessions live only in memory (local dev).
 //! - `SecretManagerPersistence`: stores sessions in GCP Secret Manager (Cloud Run).
+//!
+//! # Limitation: single-instance assumption
+//!
+//! Sessions are loaded from Secret Manager only once at startup and kept in memory
+//! thereafter. Writes (persist) go to both memory and Secret Manager, but other
+//! running instances will not see the update until they restart. Therefore
+//! `max-instances` on Cloud Run must be kept at 1. If multi-instance support is
+//! needed, consider re-loading from Secret Manager on bearer lookup cache miss,
+//! or switching to a shared store (e.g. Firestore / Redis).
 
 use std::collections::HashMap;
 
