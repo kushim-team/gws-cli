@@ -25,6 +25,7 @@ pub const DEFAULT_OAUTH_SCOPES: &str = "\
 
 /// Maximum number of entries in each HashMap to prevent memory exhaustion.
 const MAX_BEARER_SESSIONS: usize = 100_000;
+const MAX_REFRESH_TOKENS: usize = 100_000;
 const MAX_PENDING_CODES: usize = 10_000;
 const MAX_PENDING_AUTHS: usize = 10_000;
 const MAX_REGISTERED_CLIENTS: usize = 10_000;
@@ -121,6 +122,8 @@ pub struct RegisteredClient {
 pub struct TokenStore {
     /// Our bearer token -> authenticated user session.
     pub bearer_sessions: HashMap<String, UserSession>,
+    /// Our refresh token -> bearer token it was issued with.
+    pub refresh_to_bearer: HashMap<String, String>,
     /// Our auth code -> pending code exchange data.
     pub pending_codes: HashMap<String, PendingCode>,
     /// Google OAuth state -> pending authorization data.
@@ -135,6 +138,7 @@ impl TokenStore {
     pub fn new(persistence: Arc<dyn SessionPersistence>) -> Self {
         Self {
             bearer_sessions: HashMap::new(),
+            refresh_to_bearer: HashMap::new(),
             pending_codes: HashMap::new(),
             pending_auths: HashMap::new(),
             registered_clients: HashMap::new(),
@@ -166,6 +170,9 @@ impl TokenStore {
             .retain(|_, v| now - v.created_at < AUTH_CODE_TTL_SECS);
         self.bearer_sessions
             .retain(|_, v| now < v.bearer_expires_at);
+        // Remove refresh tokens whose bearer session no longer exists.
+        self.refresh_to_bearer
+            .retain(|_, bearer| self.bearer_sessions.contains_key(bearer));
     }
 
     /// Check if adding to the given map would exceed limits. Returns true if full.
@@ -179,6 +186,10 @@ impl TokenStore {
 
     pub fn is_pending_auths_full(&self) -> bool {
         self.pending_auths.len() >= MAX_PENDING_AUTHS
+    }
+
+    pub fn is_refresh_tokens_full(&self) -> bool {
+        self.refresh_to_bearer.len() >= MAX_REFRESH_TOKENS
     }
 
     pub fn is_registered_clients_full(&self) -> bool {

@@ -141,7 +141,10 @@ async fn resolve_google_token(headers: &HeaderMap, state: &AppState) -> Result<S
 
     match oauth::get_valid_google_token(&state.oauth_config, &state.token_store, &bearer).await {
         Ok(token) => Ok(token),
-        Err(_) => Err(unauthorized_response(state, "Invalid or expired token")),
+        Err(e) => {
+            tracing::warn!("Bearer auth failed: {e}");
+            Err(unauthorized_response(state, "Invalid or expired token"))
+        }
     }
 }
 
@@ -689,8 +692,9 @@ async fn handle_token_authorization_code(
         return token_error_response("invalid_grant", "PKCE validation failed", cors_headers);
     }
 
-    // Issue bearer token with 256-bit entropy.
+    // Issue bearer token and refresh token with 256-bit entropy each.
     let bearer_token = oauth::generate_secure_token();
+    let refresh_token = oauth::generate_secure_token();
     let expires_in = oauth::BEARER_TOKEN_LIFETIME_SECS;
     {
         let mut store = state.token_store.lock().await;
@@ -701,6 +705,9 @@ async fn handle_token_authorization_code(
         store
             .bearer_sessions
             .insert(bearer_token.clone(), pending_code.session);
+        store
+            .refresh_to_bearer
+            .insert(refresh_token.clone(), bearer_token.clone());
         store.persist().await;
     }
 
@@ -718,6 +725,7 @@ async fn handle_token_authorization_code(
         "access_token": bearer_token,
         "token_type": "Bearer",
         "expires_in": expires_in,
+        "refresh_token": refresh_token,
     });
 
     (
@@ -734,23 +742,33 @@ async fn handle_token_refresh(
     params: &HashMap<String, String>,
     cors_headers: HeaderMap,
 ) -> Response {
-    let old_bearer = match params.get("refresh_token") {
+    let old_refresh = match params.get("refresh_token") {
         Some(t) => t.clone(),
         None => {
             return token_error_response("invalid_request", "Missing refresh_token", cors_headers);
         }
     };
 
-    // Look up the existing session.
+    // Look up the bearer token associated with this refresh token, then the session.
     let session = {
         let mut store = state.token_store.lock().await;
+        let old_bearer = match store.refresh_to_bearer.remove(&old_refresh) {
+            Some(b) => b,
+            None => {
+                return token_error_response(
+                    "invalid_grant",
+                    "Unknown refresh token",
+                    cors_headers,
+                );
+            }
+        };
         store.bearer_sessions.remove(&old_bearer)
     };
 
     let mut session = match session {
         Some(s) => s,
         None => {
-            return token_error_response("invalid_grant", "Unknown refresh token", cors_headers);
+            return token_error_response("invalid_grant", "Session expired", cors_headers);
         }
     };
 
@@ -778,8 +796,9 @@ async fn handle_token_refresh(
         }
     }
 
-    // Issue new bearer token.
+    // Issue new bearer token and new refresh token.
     let new_bearer = oauth::generate_secure_token();
+    let new_refresh = oauth::generate_secure_token();
     let expires_in = oauth::BEARER_TOKEN_LIFETIME_SECS;
     session.bearer_expires_at = chrono::Utc::now().timestamp() + expires_in;
 
@@ -790,6 +809,9 @@ async fn handle_token_refresh(
             return token_error_response("server_error", "Too many active sessions", cors_headers);
         }
         store.bearer_sessions.insert(new_bearer.clone(), session);
+        store
+            .refresh_to_bearer
+            .insert(new_refresh.clone(), new_bearer.clone());
         store.persist().await;
     }
 
@@ -807,6 +829,7 @@ async fn handle_token_refresh(
         "access_token": new_bearer,
         "token_type": "Bearer",
         "expires_in": expires_in,
+        "refresh_token": new_refresh,
     });
 
     (
@@ -1663,11 +1686,18 @@ mod tests {
         assert_eq!(result["token_type"], "Bearer");
         assert!(result["expires_in"].as_i64().unwrap() > 0);
         assert!(result["access_token"].as_str().is_some());
+        assert!(result["refresh_token"].as_str().is_some());
 
         let bearer = result["access_token"].as_str().unwrap();
+        let refresh = result["refresh_token"].as_str().unwrap();
+        // access_token and refresh_token must be distinct values.
+        assert_ne!(bearer, refresh);
+
         let store = state.token_store.lock().await;
         let session = store.bearer_sessions.get(bearer).unwrap();
         assert_eq!(session.email, "user@test.com");
+        // refresh_to_bearer mapping must exist.
+        assert_eq!(store.refresh_to_bearer.get(refresh).unwrap(), bearer);
     }
 
     #[tokio::test]
@@ -1733,6 +1763,81 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(body["error_description"].as_str().unwrap().contains("PKCE"));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_token_grant() {
+        let state = test_state_with_oauth().await;
+        // Set up a bearer session with a corresponding refresh token.
+        let old_bearer = "old-bearer-tok";
+        let old_refresh = "old-refresh-tok";
+        {
+            let mut store = state.token_store.lock().await;
+            store
+                .bearer_sessions
+                .insert(old_bearer.to_string(), make_bearer_session());
+            store
+                .refresh_to_bearer
+                .insert(old_refresh.to_string(), old_bearer.to_string());
+        }
+
+        let app = test_app(state.clone());
+        let body_str = format!("grant_type=refresh_token&refresh_token={old_refresh}");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body_str))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+
+        let new_bearer = result["access_token"].as_str().unwrap();
+        let new_refresh = result["refresh_token"].as_str().unwrap();
+
+        // New tokens must differ from old ones.
+        assert_ne!(new_bearer, old_bearer);
+        assert_ne!(new_refresh, old_refresh);
+        // access_token and refresh_token must be distinct.
+        assert_ne!(new_bearer, new_refresh);
+
+        let store = state.token_store.lock().await;
+        // Old bearer and refresh must be removed.
+        assert!(!store.bearer_sessions.contains_key(old_bearer));
+        assert!(!store.refresh_to_bearer.contains_key(old_refresh));
+        // New ones must exist.
+        assert!(store.bearer_sessions.contains_key(new_bearer));
+        assert_eq!(
+            store.refresh_to_bearer.get(new_refresh).unwrap(),
+            new_bearer
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_token_unknown() {
+        let state = test_state_with_oauth().await;
+        let app = test_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("grant_type=refresh_token&refresh_token=bogus"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "invalid_grant");
     }
 
     #[tokio::test]
