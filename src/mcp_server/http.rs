@@ -12,8 +12,6 @@ use axum::Router;
 struct AppState {
     config: ServerConfig,
     tools_cache: Mutex<Option<Vec<Value>>>,
-    /// Maps session_id -> bearer_token.
-    sessions: Mutex<HashMap<String, String>>,
     allowed_origins: Vec<String>,
     oauth_config: OAuthConfig,
     token_store: Mutex<TokenStore>,
@@ -46,7 +44,6 @@ pub(super) async fn serve(
     let state = Arc::new(AppState {
         config,
         tools_cache: Mutex::new(None),
-        sessions: Mutex::new(HashMap::new()),
         allowed_origins,
         oauth_config,
         token_store: Mutex::new(token_store),
@@ -107,35 +104,6 @@ fn validate_origin(headers: &HeaderMap, allowed_origins: &[String]) -> bool {
         || lower.starts_with("https://127.0.0.1")
         || lower.starts_with("http://[::1]")
         || lower.starts_with("https://[::1]")
-}
-
-async fn validate_session(
-    headers: &HeaderMap,
-    sessions: &Mutex<HashMap<String, String>>,
-) -> Result<String, Response> {
-    match get_session_id(headers) {
-        Some(id) => {
-            let sessions = sessions.lock().await;
-            match sessions.get(&id) {
-                Some(bound_bearer) => {
-                    // Verify the bearer token matches the one that created this session.
-                    let bearer = extract_bearer_token(headers).unwrap_or_default();
-                    if bearer != *bound_bearer {
-                        return Err((
-                            StatusCode::FORBIDDEN,
-                            "Bearer token does not match session owner",
-                        )
-                            .into_response());
-                    }
-                    Ok(id)
-                }
-                None => {
-                    Err((StatusCode::NOT_FOUND, "Session not found or expired").into_response())
-                }
-            }
-        }
-        None => Err((StatusCode::BAD_REQUEST, "Missing Mcp-Session-Id header").into_response()),
-    }
 }
 
 /// Extract bearer token from Authorization header.
@@ -245,18 +213,8 @@ async fn handle_post(
             .into_response();
     }
 
-    let has_initialize = messages
-        .iter()
-        .any(|m| m.get("method").and_then(|v| v.as_str()) == Some("initialize"));
-
-    if !has_initialize {
-        if let Err(resp) = validate_session(&headers, &state.sessions).await {
-            return resp;
-        }
-    }
-
-    // Extract bearer token for session binding.
     let bearer_for_binding = extract_bearer_token(&headers).unwrap_or_default();
+    let mut new_session_id: Option<String> = None;
 
     // Resolve user email from bearer token for permission checks and logging.
     let user_email = if !bearer_for_binding.is_empty() {
@@ -270,7 +228,6 @@ async fn handle_post(
     };
 
     let mut responses = Vec::new();
-    let mut new_session_id: Option<String> = None;
 
     for msg in &messages {
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
@@ -306,13 +263,7 @@ async fn handle_post(
         let response = build_jsonrpc_response(&id, result);
 
         if method == "initialize" {
-            let session_id = oauth::generate_secure_token();
-            state
-                .sessions
-                .lock()
-                .await
-                .insert(session_id.clone(), bearer_for_binding.clone());
-            new_session_id = Some(session_id);
+            new_session_id = Some(oauth::generate_secure_token());
         }
 
         responses.push(response);
@@ -359,10 +310,6 @@ async fn handle_get(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
                 .into_response();
         }
     }
-    if let Err(resp) = validate_session(&headers, &state.sessions).await {
-        return resp;
-    }
-
     let stream = futures_util::stream::pending::<Result<String, std::convert::Infallible>>();
     let body = Body::from_stream(stream);
     Response::builder()
@@ -381,15 +328,7 @@ async fn handle_delete(State(state): State<Arc<AppState>>, headers: HeaderMap) -
     if let Err(resp) = resolve_google_token(&headers, &state).await {
         return resp;
     }
-    // Validate session exists and bearer matches owner.
-    match validate_session(&headers, &state.sessions).await {
-        Ok(id) => {
-            let mut sessions = state.sessions.lock().await;
-            sessions.remove(&id);
-            StatusCode::OK.into_response()
-        }
-        Err(resp) => resp,
-    }
+    StatusCode::OK.into_response()
 }
 
 // ---- OAuth endpoints ----
@@ -1045,7 +984,6 @@ mod tests {
                 tool_mode: ToolMode::Full,
             },
             tools_cache: Mutex::new(None),
-            sessions: Mutex::new(HashMap::new()),
             allowed_origins,
             oauth_config: test_oauth_config(),
             token_store: Mutex::new(TokenStore::new(Arc::new(
@@ -1146,7 +1084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tools_list_requires_session() {
+    async fn test_tools_list_without_session_id() {
         let state = test_state().await;
         let app = test_app(state);
         let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
@@ -1163,7 +1101,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1196,38 +1134,18 @@ mod tests {
     async fn test_delete_session() {
         let state = test_state().await;
         let app = test_app(state);
-        let session_id = init_session(&app).await;
         let resp = app
-            .clone()
             .oneshot(
                 Request::builder()
                     .method("DELETE")
                     .uri("/mcp")
                     .header("authorization", format!("Bearer {TEST_BEARER}"))
-                    .header("mcp-session-id", &session_id)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/mcp")
-                    .header("content-type", "application/json")
-                    .header("accept", ACCEPT_MCP)
-                    .header("authorization", format!("Bearer {TEST_BEARER}"))
-                    .header("mcp-session-id", &session_id)
-                    .body(Body::from(serde_json::to_string(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1291,7 +1209,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1310,29 +1228,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_invalid_session_returns_not_found() {
-        let state = test_state().await;
-        let app = test_app(state);
-        let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/mcp")
-                    .header("content-type", "application/json")
-                    .header("accept", ACCEPT_MCP)
-                    .header("authorization", format!("Bearer {TEST_BEARER}"))
-                    .header("mcp-session-id", "does-not-exist")
-                    .body(Body::from(serde_json::to_string(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1495,26 +1391,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE);
-    }
-
-    #[tokio::test]
-    async fn test_get_invalid_session_returns_not_found() {
-        let state = test_state().await;
-        let app = test_app(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/mcp")
-                    .header("accept", "text/event-stream")
-                    .header("authorization", format!("Bearer {TEST_BEARER}"))
-                    .header("mcp-session-id", "does-not-exist")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // --- OAuth endpoint tests ---
@@ -2004,82 +1880,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn test_session_bearer_binding_rejects_wrong_bearer() {
-        let state = test_state_with_oauth().await;
-        // Register two bearer tokens.
-        {
-            let mut store = state.token_store.lock().await;
-            store
-                .bearer_sessions
-                .insert("bearer-a".to_string(), make_bearer_session());
-            store
-                .bearer_sessions
-                .insert("bearer-b".to_string(), make_bearer_session());
-        }
-        // Create a session with bearer-a via initialize.
-        let app = test_app(state.clone());
-        let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/mcp")
-                    .header("content-type", "application/json")
-                    .header("accept", ACCEPT_MCP)
-                    .header("authorization", "Bearer bearer-a")
-                    .body(Body::from(serde_json::to_string(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let session_id = resp
-            .headers()
-            .get("mcp-session-id")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        // bearer-b should be FORBIDDEN from using bearer-a's session.
-        let app = test_app(state.clone());
-        let body2 = json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/mcp")
-                    .header("content-type", "application/json")
-                    .header("accept", ACCEPT_MCP)
-                    .header("authorization", "Bearer bearer-b")
-                    .header("mcp-session-id", &session_id)
-                    .body(Body::from(serde_json::to_string(&body2).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-        // bearer-a should still work with its own session.
-        let app = test_app(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/mcp")
-                    .header("content-type", "application/json")
-                    .header("accept", ACCEPT_MCP)
-                    .header("authorization", "Bearer bearer-a")
-                    .header("mcp-session-id", &session_id)
-                    .body(Body::from(serde_json::to_string(&body2).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
