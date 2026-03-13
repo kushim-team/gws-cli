@@ -6,11 +6,11 @@
 |-------|--------|------|-----------|
 | 1 | 既存 stdio MCP を Streamable HTTP 対応に変更 | - | DONE |
 | 2 | ユーザーごとの OAuth トークン管理 | Phase 1 | DONE |
-| 3 | Cloud Run にデプロイ | Phase 2 | TODO |
+| 3 | Cloud Run にデプロイ | Phase 2 | DONE |
 | 4 | Claude 管理コンソールで組織コネクタとして登録・動作確認 | Phase 3 | TODO |
 | 5 | 権限制御 (YAML ホワイトリスト) | Phase 2 | DONE |
 | 6 | tools/list のユーザー別フィルタ | Phase 5 | DONE |
-| 7 | 利用統計 (Cloud Logging) | Phase 2 | TODO |
+| 7 | 利用統計 (Cloud Logging) | Phase 2 | DONE |
 
 ## Phase 詳細
 
@@ -32,9 +32,9 @@
 
 ### Phase 3: Cloud Run デプロイ
 
-- [ ] Dockerfile 作成
-- [ ] CI/CD パイプライン構築
-- [ ] Secret Manager 連携
+- [x] Dockerfile 作成
+- [x] CI/CD パイプライン構築
+- [x] Secret Manager 連携
 
 ### Phase 4: 組織コネクタ登録
 
@@ -56,4 +56,4 @@
 ### Phase 7: 利用統計
 
 - [x] 構造化ログ出力（email, timestamp, method ID, result）
-- [ ] Cloud Logging への連携確認
+- [x] Cloud Logging への連携確認
