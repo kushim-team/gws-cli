@@ -19,10 +19,12 @@
 graph LR
     Client["Claude Client<br/>(Desktop / Code)"]
     Gateway["MCP Gateway<br/>(Cloud Run)"]
+    Firestore["Firestore<br/>(状態管理)"]
     Google["Google OAuth Server<br/>(accounts.google.com)"]
     GAPI["Google Workspace API"]
 
     Client -->|"MCP OAuth<br/>Bearer Token"| Gateway
+    Gateway -->|"全状態の読み書き"| Firestore
     Gateway -->|"Google OAuth<br/>Access Token"| GAPI
     Gateway -->|"認可コード交換<br/>トークンリフレッシュ"| Google
 ```
@@ -33,20 +35,21 @@ graph LR
 
 | トークン | 発行者 | 保管場所 | TTL | 用途 |
 |---------|--------|---------|-----|------|
-| **Gateway Bearer Token** (access_token) | Gateway | クライアント側 + サーバー側 (bearer_sessions) | 24 時間 (86400s) | MCP リクエストの認証 |
-| **Gateway Refresh Token** | Gateway | クライアント側 + サーバー側 (refresh_to_bearer) | Bearer Token と同じライフサイクル | Bearer Token のローテーション |
-| **Gateway Authorization Code** | Gateway | サーバー側 (pending_codes) | 10 分 (600s) | Bearer Token 取得用の一時コード |
-| **Google Access Token** | Google | サーバー側のみ (bearer_sessions) | 約 1 時間 (3600s) | Google API 呼び出し |
-| **Google Refresh Token** | Google | サーバー側のみ (bearer_sessions) | 無期限 (revoke まで) | Google Access Token の更新 |
-| **PKCE code_verifier / code_challenge** | Client | Client 側 / サーバー側 (pending_auths) | フロー完了まで | 認可コード横取り攻撃の防止 |
-| **OAuth state** | Gateway | サーバー側 (pending_auths) | 15 分 (900s) | CSRF 防止 + pending_auth の紐付け |
+| **Gateway Bearer Token** (access_token) | Gateway | クライアント側 + Firestore (`bearer_sessions`) | 1 時間 (3600s) | MCP リクエストの認証 |
+| **Gateway Refresh Token** | Gateway | クライアント側 + Firestore (`refresh_tokens`) | 7 日 (604800s) — Bearer Token とは独立 | Bearer Token のローテーション |
+| **Gateway Authorization Code** | Gateway | Firestore (`pending_codes`) | 10 分 (600s) | Bearer Token 取得用の一時コード |
+| **Google Access Token** | Google | Firestore のみ (`bearer_sessions` 内) | 約 1 時間 (3600s) | Google API 呼び出し |
+| **Google Refresh Token** | Google | Firestore のみ (`bearer_sessions` 内) | 無期限 (revoke まで) | Google Access Token の更新 |
+| **PKCE code_verifier / code_challenge** | Client | Client 側 / Firestore (`pending_auths`) | フロー完了まで | 認可コード横取り攻撃の防止 |
+| **OAuth state** | Gateway | Firestore (`pending_auths`) | 15 分 (900s) | CSRF 防止 + pending_auth の紐付け |
 
 ### Gateway Bearer Token と Refresh Token の関係
 
-- **Bearer Token** (`access_token`): MCP リクエストの `Authorization: Bearer` ヘッダーで使用
-- **Refresh Token**: `POST /token` の `grant_type=refresh_token` で使用し、新しい Bearer Token + 新しい Refresh Token を取得
-- 両者は **異なる値** (各 256-bit) で、1:1 で紐付く
+- **Bearer Token** (`access_token`): MCP リクエストの `Authorization: Bearer` ヘッダーで使用。短命 (1 時間)
+- **Refresh Token**: `POST /token` の `grant_type=refresh_token` で使用し、新しい Bearer Token + 新しい Refresh Token を取得。長命 (7 日)
+- 両者は **異なる値** (各 256-bit) で、**独立した TTL** を持つ
 - Refresh 時は **両方ともローテーション** (旧トークン無効化 + 新トークン発行)
+- Bearer Token が期限切れでも、Refresh Token が有効であれば新しい Bearer Token を取得可能
 
 ---
 
@@ -104,10 +107,10 @@ sequenceDiagram
     G->>G: PKCE 検証: SHA256(code_verifier) == code_challenge
     G->>G: Bearer Token 生成 (256-bit)
     G->>G: Refresh Token 生成 (256-bit)
-    G->>G: bearer_sessions に bearer → UserSession 保存
-    G->>G: refresh_to_bearer に refresh → bearer 保存
+    G->>G: Firestore bearer_sessions に bearer → UserSession 保存
+    G->>G: Firestore refresh_tokens に refresh → RefreshTokenEntry 保存
 
-    G-->>C: 200 {access_token: bearer_token,<br/>refresh_token: refresh_token,<br/>token_type: "Bearer", expires_in: 86400}
+    G-->>C: 200 {access_token: bearer_token,<br/>refresh_token: refresh_token,<br/>token_type: "Bearer", expires_in: 3600}
 
     Note over C: Step 7: MCP リクエスト
     C->>G: POST /mcp<br/>Authorization: Bearer <bearer_token>
@@ -132,8 +135,9 @@ sequenceDiagram
 
     C->>G: POST /token<br/>grant_type=refresh_token<br/>&refresh_token=<refresh_token>
 
-    G->>G: refresh_to_bearer から<br/>refresh_token → old_bearer を取得 + 削除
-    G->>G: bearer_sessions から<br/>old_bearer のセッション取得 + 削除
+    G->>G: Firestore refresh_tokens から<br/>RefreshTokenEntry 取得 + 削除
+    G->>G: refresh_expires_at 検証<br/>(期限切れなら invalid_grant)
+    G->>G: Firestore bearer_sessions から<br/>old_bearer のセッション取得 + 削除
 
     alt Google Access Token が期限切れ
         G->>Go: POST https://oauth2.googleapis.com/token<br/>{refresh_token=google_refresh_token,<br/>grant_type=refresh_token}
@@ -143,11 +147,11 @@ sequenceDiagram
 
     G->>G: 新しい Bearer Token 生成 (256-bit)
     G->>G: 新しい Refresh Token 生成 (256-bit)
-    G->>G: bearer_expires_at を更新 (now + 24h)
-    G->>G: bearer_sessions に new_bearer → session を保存
-    G->>G: refresh_to_bearer に new_refresh → new_bearer を保存
+    G->>G: bearer_expires_at を設定 (now + 1h)
+    G->>G: Firestore bearer_sessions に new_bearer → session を保存
+    G->>G: Firestore refresh_tokens に new_refresh → RefreshTokenEntry 保存
 
-    G-->>C: 200 {access_token: new_bearer,<br/>refresh_token: new_refresh,<br/>token_type: "Bearer", expires_in: 86400}
+    G-->>C: 200 {access_token: new_bearer,<br/>refresh_token: new_refresh,<br/>token_type: "Bearer", expires_in: 3600}
 ```
 
 ---
@@ -165,7 +169,7 @@ sequenceDiagram
 
     C->>G: POST /mcp<br/>Authorization: Bearer <bearer_token>
 
-    G->>G: bearer_sessions から session 取得
+    G->>G: Firestore bearer_sessions から session 取得
     G->>G: bearer_expires_at 検証
 
     alt Bearer Token 期限切れ
@@ -176,8 +180,15 @@ sequenceDiagram
 
     alt Google Access Token が期限切れ or 60秒以内に期限切れ
         G->>Go: POST /token<br/>{refresh_token, grant_type=refresh_token}
-        Go-->>G: {new_access_token, expires_in}
-        G->>G: session.google_tokens を更新 + persist
+        alt Google Refresh Token が有効
+            Go-->>G: {new_access_token, expires_in}
+            G->>G: session.google_tokens を更新 + Firestore に保存
+        else Google Refresh Token が無効 (revoke / パスワード変更)
+            Go-->>G: 400 {error: "invalid_grant"}
+            G->>G: Firestore から bearer_session を削除
+            G->>G: Firestore から関連する refresh_token を削除
+            G-->>C: 401 Unauthorized<br/>(クライアントは /authorize から再認証)
+        end
     end
 
     G->>GAPI: API 呼び出し (Google Access Token)
@@ -221,20 +232,36 @@ flowchart TD
 
 ## 7. トークン状態遷移
 
-### Gateway Bearer Token + Refresh Token ペア
+### Gateway Bearer Token
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Active: POST /token (authorization_code)<br/>bearer (256-bit) + refresh (256-bit) 生成
+    [*] --> Active: POST /token (authorization_code)<br/>bearer (256-bit) 生成
 
-    Active --> Active: MCP リクエスト認証成功<br/>(bearer のみ使用)
+    Active --> Active: MCP リクエスト認証成功
 
-    Active --> Rotated: POST /token (refresh_token)<br/>旧ペア削除 + 新ペア発行
-    Rotated --> Active: 新しい bearer + refresh として
+    Active --> Rotated: POST /token (refresh_token)<br/>旧 bearer 削除 + 新 bearer 発行
+    Rotated --> Active: 新しい bearer として
 
-    Active --> Expired: 24時間経過<br/>(bearer_expires_at)
-    Expired --> CleanedUp: cleanup_expired()<br/>bearer 削除 → 紐付く refresh も削除
-    CleanedUp --> [*]
+    Active --> Expired: 1時間経過<br/>(bearer_expires_at)
+    Expired --> Deleted: Firestore TTL による自動削除
+    Deleted --> [*]
+```
+
+### Gateway Refresh Token
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active: POST /token (authorization_code)<br/>refresh (256-bit) 生成<br/>refresh_expires_at = now + 7日
+
+    Active --> Rotated: POST /token (refresh_token)<br/>旧 refresh 削除 + 新 refresh 発行
+    Rotated --> Active: 新しい refresh として
+
+    Active --> Expired: 7日経過<br/>(refresh_expires_at)
+    Expired --> Deleted: Firestore TTL による自動削除
+    Deleted --> [*]
+
+    note right of Active: Bearer Token が期限切れ (1h) でも<br/>Refresh Token が有効なら<br/>新しい Bearer Token を取得可能
 ```
 
 ### Google Access Token (サーバー側)
@@ -256,28 +283,33 @@ stateDiagram-v2
     [*] --> Stored: 初回 OAuth consent で取得<br/>(access_type=offline, prompt=consent)
     Stored --> Stored: Google access_token リフレッシュ時に<br/>Google が新 refresh_token を返さない<br/>→ 元の refresh_token を保持
     Stored --> Invalid: ユーザーが Google 側で revoke<br/>or パスワード変更
-    Invalid --> [*]: refresh 失敗 → 再認証必要
+    Invalid --> SessionDestroyed: Google が invalid_grant を返却<br/>→ bearer_session + refresh_token を<br/>Firestore から削除
+    SessionDestroyed --> [*]: 401 Unauthorized → クライアントが再認証
 ```
 
 ---
 
-## 8. サーバー側データストア (TokenStore)
+## 8. サーバー側データストア (StateStore)
+
+サーバーは **完全ステートレス** で動作する。全状態は外部ストア (Firestore) に保存され、サーバー再起動やスケールアウトの影響を受けない。
+
+### ストアバックエンド
+
+| バックエンド | 用途 | 特徴 |
+|-------------|------|------|
+| **Firestore** | 本番 (Cloud Run) | 全状態を永続化。TTL ポリシーで自動削除。マルチインスタンス対応 |
+| **InMemory** | ローカル開発・テスト | HashMap ベース。プロセス終了で消失。容量制限あり |
+
+### Firestore コレクション構造
 
 ```mermaid
 erDiagram
-    TokenStore {
-        HashMap bearer_sessions
-        HashMap refresh_to_bearer
-        HashMap pending_codes
-        HashMap pending_auths
-        HashMap registered_clients
-    }
-
-    BearerSessions ||--o{ UserSession : "bearer_token → "
+    bearer_sessions ||--o{ UserSession : "doc ID = bearer_token"
     UserSession {
         string email
         GoogleTokens google_tokens
         i64 bearer_expires_at
+        timestamp expires_at "Firestore TTL フィールド"
     }
     GoogleTokens {
         string access_token
@@ -285,9 +317,14 @@ erDiagram
         i64 expires_at "Optional"
     }
 
-    RefreshToBearer ||--o{ string : "refresh_token → bearer_token"
+    refresh_tokens ||--o{ RefreshTokenEntry : "doc ID = refresh_token"
+    RefreshTokenEntry {
+        string bearer_token
+        i64 refresh_expires_at
+        timestamp expires_at "Firestore TTL フィールド"
+    }
 
-    PendingAuths ||--o{ PendingAuth : "gateway_state → "
+    pending_auths ||--o{ PendingAuth : "doc ID = gateway_state"
     PendingAuth {
         string client_redirect_uri
         string client_state "Optional"
@@ -295,49 +332,121 @@ erDiagram
         string code_challenge_method
         string client_id
         i64 created_at
+        timestamp expires_at "Firestore TTL フィールド"
     }
 
-    PendingCodes ||--o{ PendingCode : "gateway_auth_code → "
+    pending_codes ||--o{ PendingCode : "doc ID = gateway_auth_code"
     PendingCode {
         UserSession session
         string code_challenge
         string code_challenge_method
         i64 created_at
+        timestamp expires_at "Firestore TTL フィールド"
     }
 
-    RegisteredClients ||--o{ RegisteredClient : "client_id → "
+    registered_clients ||--o{ RegisteredClient : "doc ID = client_id"
     RegisteredClient {
         string client_id
         string[] redirect_uris
         string client_name "Optional"
         i64 client_id_issued_at
+        timestamp expires_at "Firestore TTL フィールド"
     }
 ```
 
-### 容量制限
+### Firestore ドキュメント形式
+
+各ドキュメントは以下の 2 フィールドで構成:
+
+| フィールド | 型 | 用途 |
+|-----------|-----|------|
+| `data` | `stringValue` | 構造体を JSON シリアライズ → **AES-256-GCM で暗号化** → Base64 エンコードした文字列 |
+| `expires_at` | `timestampValue` | Firestore TTL ポリシーによる自動削除用 |
+
+### アプリケーション層暗号化 (Encryption at Rest)
+
+Firestore には Google OAuth トークン (access_token, refresh_token) を含む機密データが保存される。Firestore のデフォルト暗号化 (Google-managed key) に加え、**アプリケーション層で AES-256-GCM 暗号化** を適用する。
+
+#### 暗号化アーキテクチャ
+
+```
+書き込み: struct → JSON serialize → AES-256-GCM encrypt → Base64 encode → Firestore `data` field
+読み取り: Firestore `data` field → Base64 decode → AES-256-GCM decrypt → JSON deserialize → struct
+```
+
+#### 暗号化仕様
+
+| 項目 | 値 |
+|------|-----|
+| アルゴリズム | AES-256-GCM (AEAD) |
+| 鍵長 | 256 bit |
+| Nonce | 96 bit (各暗号化操作で一意に生成) |
+| 鍵の保管場所 | **Secret Manager** (`projects/{project}/secrets/firestore-encryption-key`) |
+| 鍵のロード | サーバー起動時に Secret Manager から取得し、メモリ上に保持 |
+| Base64 エンコード | `nonce (12 bytes) || ciphertext || tag (16 bytes)` を結合して Base64 |
+
+#### 鍵管理
+
+- 暗号化鍵は **Secret Manager** に保存し、Cloud Run サービスアカウントのみアクセス可能にする
+- 鍵のローテーション時は新しいバージョンを追加し、古いバージョンで暗号化されたデータは TTL で自然消滅する (Bearer: 1h, Refresh: 7d)
+- 鍵ローテーション中の復号失敗時は、セッションを無効として扱い再認証を促す (データロスなし)
+
+#### 追加のセキュリティ対策
+
+| 対策 | 説明 |
+|------|------|
+| 専用 Firestore データベース | デフォルト DB ではなく、MCP Gateway 専用の名前付き DB を使用。他サービスとの分離 |
+| Data Access 監査ログ | Firestore の Data Access 監査ログを有効化。不正アクセスの検知・追跡 |
+| 最小権限 IAM | Cloud Run サービスアカウントに `datastore.user` ロールのみ付与 |
+
+### TTL 設定
+
+| コレクション | ドキュメント ID | expires_at | 用途 |
+|-------------|---------------|------------|------|
+| `bearer_sessions` | bearer_token | now + 1h | Bearer Token セッション |
+| `refresh_tokens` | refresh_token | now + 7d | Refresh Token エントリ |
+| `pending_auths` | gateway_state | now + 15m | OAuth 認可フロー中間状態 |
+| `pending_codes` | auth_code | now + 10m | 認可コード交換待ち |
+| `registered_clients` | client_id | now + 7d | 動的クライアント登録 |
+
+Firestore TTL ポリシーは各コレクションの `expires_at` フィールドに対して有効化する:
+
+```bash
+gcloud firestore fields ttls update expires_at \
+  --collection-group=bearer_sessions --enable-ttl
+# refresh_tokens, pending_auths, pending_codes, registered_clients も同様
+```
+
+> **注意**: Firestore TTL による削除は結果整合性 (数分〜最大 24 時間の遅延)。アプリケーションコードでも TTL を検証し、期限切れドキュメントは無効として扱う。
+
+### 容量制限 (InMemory バックエンドのみ)
 
 | Map | 上限 |
 |-----|------|
 | `bearer_sessions` | 100,000 |
-| `refresh_to_bearer` | 100,000 |
+| `refresh_tokens` | 100,000 |
 | `pending_codes` | 10,000 |
 | `pending_auths` | 10,000 |
 | `registered_clients` | 10,000 |
 
-### 永続化
+InMemory バックエンドでは `set_*()` メソッド内で `cleanup_expired()` を実行し、上限を超える場合はエラーを返す。
+`bearer_sessions` と `refresh_tokens` の **両方** で容量チェックを行う。
 
-- `bearer_sessions` のみ `SessionPersistence` トレイトで永続化 (Secret Manager or Memory)
-- `refresh_to_bearer` はインメモリのみ (bearer_sessions から復元不可のため、サーバー再起動時はクライアントの再認証が必要)
-- `pending_auths`, `pending_codes` はインメモリのみ (短命のため)
-- `registered_clients` はインメモリのみ (サーバー再起動で再登録が必要)
+Firestore バックエンドでは容量制限は不要 (TTL で自動削除、Firestore 自体が大規模データに対応)。
 
 ### クリーンアップ
 
-`cleanup_expired()` で以下を削除:
+| バックエンド | 方式 |
+|-------------|------|
+| **Firestore** | `expires_at` フィールドに基づく TTL ポリシーで自動削除。アプリケーション側の明示的なクリーンアップは不要 |
+| **InMemory** | `set_*()` 呼び出し時に `cleanup_expired()` を内部実行し、期限切れエントリを除去 |
+
+InMemory の `cleanup_expired()` で削除される条件:
 - `pending_auths`: `created_at` から 15 分経過
 - `pending_codes`: `created_at` から 10 分経過
 - `bearer_sessions`: `bearer_expires_at` を超過
-- `refresh_to_bearer`: 紐付く bearer が `bearer_sessions` に存在しないもの
+- `refresh_tokens`: `refresh_expires_at` を超過
+- `registered_clients`: `client_id_issued_at` から 7 日経過
 
 ---
 
@@ -360,8 +469,8 @@ erDiagram
 {
   "access_token": "<bearer_token (256-bit)>",
   "token_type": "Bearer",
-  "expires_in": 86400,
-  "refresh_token": "<refresh_token (256-bit, bearer とは別の値)>"
+  "expires_in": 3600,
+  "refresh_token": "<refresh_token (256-bit, bearer とは独立した TTL)>"
 }
 ```
 
@@ -371,12 +480,18 @@ erDiagram
 
 | 方針 | 実装 |
 |------|------|
-| Google トークンはクライアントに露出しない | サーバー側保持、レスポンスに含めない |
+| 全状態の外部ストア化 | Firestore に全状態を保存。サーバーは完全ステートレスで、再起動・スケールアウトに耐える |
+| Bearer Token 短命 / Refresh Token 長命 | Bearer Token: 1 時間、Refresh Token: 7 日 (独立 TTL)。漏洩時の影響を最小化 |
+| Google トークンはクライアントに露出しない | サーバー側 (Firestore) 保持、レスポンスに含めない |
 | PKCE 必須 (S256 のみ) | plain は明示的に拒否 |
 | Bearer Token / Refresh Token は暗号学的に安全 | 各 256-bit OsRng エントロピー |
 | Refresh Token Rotation | refresh 時に旧ペアを無効化し新ペアを発行 |
 | redirect_uri はスキーム検証 | https:// or http://localhost のみ |
 | クライアント登録制 | /authorize 時に registered_clients を検証 |
-| 期限切れの自動クリーンアップ | リクエスト時に cleanup_expired() を実行 |
+| 期限切れの自動クリーンアップ | Firestore: TTL ポリシーで自動削除。InMemory: set_*() 時に cleanup_expired() を実行 |
 | Token レスポンスはキャッシュ禁止 | Cache-Control: no-store |
 | Google token refresh に 60 秒バッファ | リクエスト途中の期限切れを防止 |
+| Google Refresh Token 失効時のセッション無効化 | Google が `invalid_grant` を返した場合、bearer_session と refresh_token を Firestore から削除し 401 を返却。クライアントに再認証を促す |
+| Firestore データのアプリケーション層暗号化 | AES-256-GCM で `data` フィールドを暗号化。暗号化鍵は Secret Manager に保管。Firestore のデフォルト暗号化との二重防御 |
+| 専用 Firestore データベース | MCP Gateway 専用の名前付き DB を使用し、他サービスと分離 |
+| Data Access 監査ログ | Firestore の Data Access 監査ログを有効化し、不正アクセスを検知・追跡可能にする |
