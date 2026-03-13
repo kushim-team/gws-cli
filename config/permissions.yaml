@@ -38,7 +38,7 @@ roles:
       # drive.drives.delete            — 除外（共有ドライブ削除）
       - "drive.files.copy"
       - "drive.files.create"
-      - "drive.files.download"
+      # - "drive.files.download"       - 除外（downloadは非同期APIのため、MCPでは使用しない）
       - "drive.files.export"
       - "drive.files.generateIds"
       - "drive.files.get"

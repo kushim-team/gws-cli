@@ -5,9 +5,9 @@
 
 # Core engine code strictly requires your review
 # Isolates agents to `skills/` or `src/helpers/` unless absolutely necessary
-/src/main.rs @jpoehnelt
-/src/executor.rs @jpoehnelt
-/src/discovery.rs @jpoehnelt
-/src/commands.rs @jpoehnelt
-/src/auth.rs @jpoehnelt
-/src/schema.rs @jpoehnelt
+/src/main.rs @vitocchi
+/src/executor.rs @vitocchi
+/src/discovery.rs @vitocchi
+/src/commands.rs @vitocchi
+/src/auth.rs @vitocchi
+/src/schema.rs @vitocchi
