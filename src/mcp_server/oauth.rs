@@ -157,7 +157,7 @@ impl TokenStore {
     /// Errors are logged but not propagated to avoid blocking request handling.
     pub async fn persist(&self) {
         if let Err(e) = self.persistence.save(&self.bearer_sessions).await {
-            tracing::warn!("Failed to persist sessions: {e}");
+            tracing::warn!(error = %e, "failed to persist sessions");
         }
     }
 

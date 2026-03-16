@@ -38,7 +38,7 @@ pub(super) async fn serve(
 
     let mut token_store = TokenStore::new(persistence);
     if let Err(e) = token_store.load_persisted_sessions().await {
-        tracing::warn!("Failed to load persisted sessions: {e}");
+        tracing::warn!(error = %e, "failed to load persisted sessions");
     }
 
     let state = Arc::new(AppState {
@@ -71,7 +71,7 @@ pub(super) async fn serve(
         .await
         .map_err(|e| GwsError::Other(anyhow::anyhow!("Failed to bind to {addr}: {e}")))?;
 
-    eprintln!("[gws mcp] HTTP server listening on http://{addr}/mcp");
+    tracing::info!(addr = %addr, "HTTP server listening");
 
     axum::serve(listener, app)
         .await
@@ -541,7 +541,7 @@ async fn handle_oauth_callback(
     let google_tokens = match oauth::exchange_google_code(oauth_config, &google_code).await {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("[gws mcp] Google token exchange failed: {e}");
+            tracing::error!(error = %e, "google token exchange failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Token exchange failed").into_response();
         }
     };
@@ -550,12 +550,12 @@ async fn handle_oauth_callback(
     let email = match oauth::get_google_userinfo(&google_tokens.access_token).await {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("[gws mcp] Failed to get userinfo: {e}");
+            tracing::error!(error = %e, "failed to get userinfo");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to identify user").into_response();
         }
     };
 
-    eprintln!("[gws mcp] OAuth callback: authenticated user {email}");
+    tracing::info!(email = email.as_str(), "oauth callback: user authenticated");
 
     // Generate our auth code for the client.
     let our_code = oauth::generate_secure_token();
