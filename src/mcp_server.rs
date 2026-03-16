@@ -321,15 +321,13 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
     init_usage_tracing();
 
     if config.services.is_empty() {
-        eprintln!("[gws mcp] Warning: No services configured. Zero tools will be exposed.");
-        eprintln!("[gws mcp] Re-run with: gws mcp -s <service> (e.g., -s drive,gmail,calendar)");
-        eprintln!("[gws mcp] Use -s all to expose all available services.");
+        tracing::warn!("no services configured, zero tools will be exposed");
     } else {
-        eprintln!(
-            "[gws mcp] Starting with services: {}",
-            config.services.join(", ")
+        tracing::info!(
+            services = config.services.join(", "),
+            tool_mode = ?config.tool_mode,
+            "server starting"
         );
-        eprintln!("[gws mcp] Tool mode: {:?}", config.tool_mode);
     }
 
     // Parse required OAuth config.
@@ -339,7 +337,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
     let base_url = base_url.trim_end_matches('/').to_string();
     oauth::validate_gateway_base_url(&base_url).map_err(GwsError::Validation)?;
     let scopes = matches.get_one::<String>("oauth-scopes").unwrap().clone();
-    eprintln!("[gws mcp] OAuth enabled for gateway auth");
+    tracing::info!("oauth enabled for gateway auth");
     let oauth_config = oauth::OAuthConfig {
         client_id: client_id.clone(),
         client_secret: client_secret.clone(),
@@ -352,7 +350,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         Some(path) => {
             let pc =
                 permissions::PermissionsConfig::load_from_file(path).map_err(GwsError::Other)?;
-            eprintln!("[gws mcp] Permissions loaded from {path}");
+            tracing::info!(path = path, "permissions loaded");
             Some(pc)
         }
         None => None,
@@ -379,9 +377,9 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
                 }
             }
             oauth_config.scopes = scopes.join(" ");
-            eprintln!(
-                "[gws mcp] OAuth scopes narrowed to permissions union: {}",
-                oauth_config.scopes
+            tracing::info!(
+                scopes = oauth_config.scopes,
+                "oauth scopes narrowed to permissions union"
             );
         }
     }
@@ -405,15 +403,21 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
                 .get_one::<String>("secret-manager-secret")
                 .unwrap()
                 .clone();
-            eprintln!(
-                "[gws mcp] Token store: Secret Manager (project={project}, secret={secret_id})"
+            tracing::info!(
+                backend = "secret-manager",
+                project = project,
+                secret_id = secret_id,
+                "token store configured"
             );
             Arc::new(session_store::SecretManagerPersistence::new(
                 project, secret_id,
             ))
         }
         _ => {
-            eprintln!("[gws mcp] Token store: in-memory (sessions lost on restart)");
+            tracing::info!(
+                backend = "in-memory",
+                "token store configured (sessions lost on restart)"
+            );
             Arc::new(session_store::InMemoryPersistence)
         }
     };
@@ -421,7 +425,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
     let port = *matches.get_one::<u16>("port").unwrap();
     let host = matches.get_one::<String>("host").unwrap().clone();
     let allow_origin = matches.get_one::<String>("allow-origin").unwrap().clone();
-    eprintln!("[gws mcp] Starting HTTP transport on {host}:{port}");
+    tracing::info!(host = host, port = port, "starting HTTP transport");
     http::serve(
         config,
         &host,
@@ -526,7 +530,10 @@ async fn build_tools_list(config: &ServerConfig) -> Result<Vec<Value>, GwsError>
         if let Ok(doc) = crate::discovery::fetch_discovery_document(&api_name, &version).await {
             walk_resources(&doc.name, &doc.resources, &mut tools);
         } else {
-            eprintln!("[gws mcp] Warning: Failed to load discovery document for service '{}'. It will not be available as a tool.", svc_name);
+            tracing::warn!(
+                service = svc_name.as_str(),
+                "failed to load discovery document, service will not be available as a tool"
+            );
         }
     }
 
@@ -563,9 +570,9 @@ async fn build_compact_tools_list(config: &ServerConfig) -> Result<Vec<Value>, G
                 format!("{}. Resources: {}", desc, names_str.join(", "))
             }
         } else {
-            eprintln!(
-                "[gws mcp] Warning: Failed to load discovery document for '{}'. Tool will have minimal description.",
-                svc_name
+            tracing::warn!(
+                service = svc_name.as_str(),
+                "failed to load discovery document, tool will have minimal description"
             );
             format!("Google Workspace API: {}", svc_name)
         };
