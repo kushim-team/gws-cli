@@ -1038,8 +1038,8 @@ async fn handle_tools_call(
                 let method_id = format!("{}.{}.{}", svc_alias, resource_path, method_name);
                 if !perms.is_method_allowed_with_scopes(email, &method_id, &method.scopes) {
                     return Err(GwsError::Validation(format!(
-                        "Permission denied: '{}' is not allowed for user '{}'",
-                        method_id, email
+                        "Permission denied: '{}' is not allowed for the current user",
+                        method_id
                     )));
                 }
             }

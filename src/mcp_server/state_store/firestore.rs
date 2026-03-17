@@ -362,6 +362,14 @@ impl FirestoreStateStore {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+
+            // Firestore returns FAILED_PRECONDITION (HTTP 400) when a
+            // currentDocument precondition is not met (e.g. document already
+            // deleted). Treat this the same as CONFLICT for take-once semantics.
+            if body.contains("FAILED_PRECONDITION") {
+                return Err(StateStoreError::TransactionConflict);
+            }
+
             let truncated = if body.len() > 300 {
                 &body[..300]
             } else {
