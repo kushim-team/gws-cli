@@ -19,7 +19,7 @@ mod http;
 mod jsonrpc;
 pub(crate) mod oauth;
 pub(crate) mod permissions;
-pub(crate) mod session_store;
+pub(crate) mod state_store;
 
 use crate::discovery::RestResource;
 use crate::error::GwsError;
@@ -134,23 +134,30 @@ fn build_mcp_cli() -> Command {
         .arg(
             Arg::new("token-store-backend")
                 .long("token-store-backend")
-                .value_parser(["memory", "secret-manager"])
+                .value_parser(["memory", "firestore"])
                 .default_value("memory")
-                .help("Token store backend: 'memory' (local dev) or 'secret-manager' (Cloud Run)")
+                .help("Token store backend: 'memory' (local dev) or 'firestore' (Cloud Run)")
                 .env("GWS_TOKEN_STORE_BACKEND"),
         )
         .arg(
-            Arg::new("secret-manager-project")
-                .long("secret-manager-project")
-                .help("GCP project ID for Secret Manager (required when backend=secret-manager)")
-                .env("GWS_SECRET_MANAGER_PROJECT"),
+            Arg::new("firestore-project")
+                .long("firestore-project")
+                .help("GCP project ID for Firestore (required when backend=firestore)")
+                .env("GWS_FIRESTORE_PROJECT"),
         )
         .arg(
-            Arg::new("secret-manager-secret")
-                .long("secret-manager-secret")
-                .help("Secret ID in Secret Manager (env: GWS_SECRET_MANAGER_SECRET)")
-                .env("GWS_SECRET_MANAGER_SECRET")
-                .default_value("gws-mcp-sessions"),
+            Arg::new("firestore-database")
+                .long("firestore-database")
+                .help("Firestore database ID (env: GWS_FIRESTORE_DATABASE)")
+                .env("GWS_FIRESTORE_DATABASE")
+                .default_value("mcp-gateway"),
+        )
+        .arg(
+            Arg::new("encryption-key-secret")
+                .long("encryption-key-secret")
+                .help("Secret Manager secret name for encryption key (env: GWS_ENCRYPTION_KEY_SECRET)")
+                .env("GWS_ENCRYPTION_KEY_SECRET")
+                .default_value("mcp-gateway-encryption-key"),
         )
 }
 
@@ -384,41 +391,54 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         }
     }
 
-    // Build session persistence backend.
+    // Build state store backend.
     let backend = matches
         .get_one::<String>("token-store-backend")
         .unwrap()
         .as_str();
-    let persistence: Arc<dyn session_store::SessionPersistence> = match backend {
-        "secret-manager" => {
+    let store: Arc<dyn state_store::StateStore> = match backend {
+        "firestore" => {
             let project = matches
-                .get_one::<String>("secret-manager-project")
+                .get_one::<String>("firestore-project")
                 .ok_or_else(|| {
                     GwsError::Validation(
-                        "--secret-manager-project is required when token-store-backend=secret-manager".to_string(),
+                        "--firestore-project is required when token-store-backend=firestore"
+                            .to_string(),
                     )
                 })?
                 .clone();
-            let secret_id = matches
-                .get_one::<String>("secret-manager-secret")
+            let database = matches
+                .get_one::<String>("firestore-database")
+                .unwrap()
+                .clone();
+            let encryption_key_secret = matches
+                .get_one::<String>("encryption-key-secret")
                 .unwrap()
                 .clone();
             tracing::info!(
-                backend = "secret-manager",
+                backend = "firestore",
                 project = project,
-                secret_id = secret_id,
-                "token store configured"
+                database = database,
+                "state store configured"
             );
-            Arc::new(session_store::SecretManagerPersistence::new(
-                project, secret_id,
-            ))
+            Arc::new(
+                state_store::FirestoreStateStore::from_secret_manager(
+                    project,
+                    database,
+                    encryption_key_secret,
+                )
+                .await
+                .map_err(|e| {
+                    GwsError::Other(anyhow::anyhow!("Failed to init Firestore store: {e}"))
+                })?,
+            )
         }
         _ => {
             tracing::info!(
                 backend = "in-memory",
-                "token store configured (sessions lost on restart)"
+                "state store configured (sessions lost on restart)"
             );
-            Arc::new(session_store::InMemoryPersistence)
+            Arc::new(state_store::InMemoryStateStore::new())
         }
     };
 
@@ -433,7 +453,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         &allow_origin,
         oauth_config,
         permissions_config,
-        persistence,
+        store,
     )
     .await
 }

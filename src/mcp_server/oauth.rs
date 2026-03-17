@@ -1,15 +1,12 @@
 //! OAuth token management for the MCP Gateway.
 //!
-//! Handles Google OAuth flow delegation, per-user token storage,
-//! PKCE validation, and automatic token refresh.
-
-use std::collections::HashMap;
-use std::sync::Arc;
+//! Handles Google OAuth flow delegation, PKCE validation,
+//! and automatic token refresh.
 
 use sha2::Digest;
-use tokio::sync::Mutex;
+use std::sync::Arc;
 
-use super::session_store::SessionPersistence;
+use super::state_store::{StateStore, StateStoreError, UserSessionData};
 
 /// Default Google OAuth scopes requested during consent.
 pub const DEFAULT_OAUTH_SCOPES: &str = "\
@@ -22,22 +19,6 @@ pub const DEFAULT_OAUTH_SCOPES: &str = "\
     https://www.googleapis.com/auth/presentations \
     https://www.googleapis.com/auth/chat.messages \
     https://www.googleapis.com/auth/tasks";
-
-/// Maximum number of entries in each HashMap to prevent memory exhaustion.
-const MAX_BEARER_SESSIONS: usize = 100_000;
-const MAX_REFRESH_TOKENS: usize = 100_000;
-const MAX_PENDING_CODES: usize = 10_000;
-const MAX_PENDING_AUTHS: usize = 10_000;
-const MAX_REGISTERED_CLIENTS: usize = 10_000;
-
-/// Bearer token lifetime in seconds (24 hours).
-pub const BEARER_TOKEN_LIFETIME_SECS: i64 = 86400;
-
-/// Authorization code TTL in seconds (10 minutes).
-pub const AUTH_CODE_TTL_SECS: i64 = 600;
-
-/// Pending auth TTL in seconds (15 minutes).
-pub const PENDING_AUTH_TTL_SECS: i64 = 900;
 
 /// OAuth configuration for the MCP Gateway.
 #[derive(Clone)]
@@ -75,125 +56,6 @@ impl GoogleTokens {
         self.expires_at
             .map(|ea| chrono::Utc::now().timestamp() + 60 >= ea)
             .unwrap_or(false)
-    }
-}
-
-/// An authenticated user session backed by Google OAuth tokens.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct UserSession {
-    #[allow(dead_code)] // Used in Phase 5 (permissions) and Phase 7 (logging)
-    pub email: String,
-    pub google_tokens: GoogleTokens,
-    /// Unix timestamp when the bearer token expires.
-    pub bearer_expires_at: i64,
-}
-
-/// State tracked between the `/authorize` redirect and the `/oauth/callback`.
-#[derive(Debug, Clone)]
-pub struct PendingAuth {
-    pub client_redirect_uri: String,
-    pub client_state: Option<String>,
-    pub code_challenge: String,
-    pub code_challenge_method: String,
-    #[allow(dead_code)] // Used for audit logging and future per-client rate limiting
-    pub client_id: String,
-    pub created_at: i64,
-}
-
-/// State tracked between the `/oauth/callback` and the `POST /token` exchange.
-#[derive(Debug, Clone)]
-pub struct PendingCode {
-    pub session: UserSession,
-    pub code_challenge: String,
-    pub code_challenge_method: String,
-    pub created_at: i64,
-}
-
-/// A dynamically registered OAuth client.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct RegisteredClient {
-    pub client_id: String,
-    pub redirect_uris: Vec<String>,
-    pub client_name: Option<String>,
-    pub client_id_issued_at: i64,
-}
-
-/// Token and session store with pluggable persistence backend.
-pub struct TokenStore {
-    /// Our bearer token -> authenticated user session.
-    pub bearer_sessions: HashMap<String, UserSession>,
-    /// Our refresh token -> bearer token it was issued with.
-    pub refresh_to_bearer: HashMap<String, String>,
-    /// Our auth code -> pending code exchange data.
-    pub pending_codes: HashMap<String, PendingCode>,
-    /// Google OAuth state -> pending authorization data.
-    pub pending_auths: HashMap<String, PendingAuth>,
-    /// Dynamically registered clients.
-    pub registered_clients: HashMap<String, RegisteredClient>,
-    /// Persistence backend for bearer sessions.
-    persistence: Arc<dyn SessionPersistence>,
-}
-
-impl TokenStore {
-    pub fn new(persistence: Arc<dyn SessionPersistence>) -> Self {
-        Self {
-            bearer_sessions: HashMap::new(),
-            refresh_to_bearer: HashMap::new(),
-            pending_codes: HashMap::new(),
-            pending_auths: HashMap::new(),
-            registered_clients: HashMap::new(),
-            persistence,
-        }
-    }
-
-    /// Load persisted sessions from the backend into memory.
-    pub async fn load_persisted_sessions(&mut self) -> anyhow::Result<()> {
-        let sessions = self.persistence.load().await?;
-        self.bearer_sessions = sessions;
-        Ok(())
-    }
-
-    /// Persist current bearer sessions to the backend.
-    /// Errors are logged but not propagated to avoid blocking request handling.
-    pub async fn persist(&self) {
-        if let Err(e) = self.persistence.save(&self.bearer_sessions).await {
-            tracing::warn!(error = %e, "failed to persist sessions");
-        }
-    }
-
-    /// Remove expired entries from all maps (lazy cleanup).
-    pub fn cleanup_expired(&mut self) {
-        let now = chrono::Utc::now().timestamp();
-        self.pending_auths
-            .retain(|_, v| now - v.created_at < PENDING_AUTH_TTL_SECS);
-        self.pending_codes
-            .retain(|_, v| now - v.created_at < AUTH_CODE_TTL_SECS);
-        self.bearer_sessions
-            .retain(|_, v| now < v.bearer_expires_at);
-        // Remove refresh tokens whose bearer session no longer exists.
-        self.refresh_to_bearer
-            .retain(|_, bearer| self.bearer_sessions.contains_key(bearer));
-    }
-
-    /// Check if adding to the given map would exceed limits. Returns true if full.
-    pub fn is_bearer_sessions_full(&self) -> bool {
-        self.bearer_sessions.len() >= MAX_BEARER_SESSIONS
-    }
-
-    pub fn is_pending_codes_full(&self) -> bool {
-        self.pending_codes.len() >= MAX_PENDING_CODES
-    }
-
-    pub fn is_pending_auths_full(&self) -> bool {
-        self.pending_auths.len() >= MAX_PENDING_AUTHS
-    }
-
-    pub fn is_refresh_tokens_full(&self) -> bool {
-        self.refresh_to_bearer.len() >= MAX_REFRESH_TOKENS
-    }
-
-    pub fn is_registered_clients_full(&self) -> bool {
-        self.registered_clients.len() >= MAX_REGISTERED_CLIENTS
     }
 }
 
@@ -276,6 +138,9 @@ pub async fn exchange_google_code(
 }
 
 /// Refresh a Google access token using a refresh token.
+///
+/// Returns `Err` with a message containing "invalid_grant" if Google rejects
+/// the refresh token (revoked, password changed, etc.).
 pub async fn refresh_google_token(
     config: &OAuthConfig,
     refresh_token: &str,
@@ -372,58 +237,88 @@ pub fn base64_url_encode(data: &[u8]) -> String {
 }
 
 /// Get a valid Google access token for a bearer session, refreshing if needed.
+///
+/// On Google `invalid_grant`, deletes the user_session and bearer_session
+/// from the store and returns an error.
 pub async fn get_valid_google_token(
     config: &OAuthConfig,
-    store: &Mutex<TokenStore>,
+    store: &Arc<dyn StateStore>,
     bearer_token: &str,
 ) -> anyhow::Result<String> {
-    // Check bearer token expiry and current Google token state.
-    let (needs_refresh, refresh_token_opt) = {
-        let guard = store.lock().await;
-        let session = guard
-            .bearer_sessions
-            .get(bearer_token)
-            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+    // Look up bearer session.
+    let bearer_session = store
+        .get_bearer_session(bearer_token)
+        .await
+        .map_err(|e| match e {
+            StateStoreError::Unavailable(msg) => anyhow::anyhow!("Store unavailable: {msg}"),
+            other => anyhow::anyhow!("{other}"),
+        })?
+        .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
-        // Check bearer token expiry.
-        if chrono::Utc::now().timestamp() >= session.bearer_expires_at {
-            anyhow::bail!("Bearer token expired");
-        }
-
-        if session.google_tokens.is_expired() {
-            (true, session.google_tokens.refresh_token.clone())
-        } else {
-            return Ok(session.google_tokens.access_token.clone());
-        }
-    };
-
-    if needs_refresh {
-        let rt = refresh_token_opt
-            .ok_or_else(|| anyhow::anyhow!("Cannot refresh: no refresh_token available"))?;
-        let new_tokens = refresh_google_token(config, &rt).await?;
-        let access_token = new_tokens.access_token.clone();
-
-        let mut guard = store.lock().await;
-        if let Some(session) = guard.bearer_sessions.get_mut(bearer_token) {
-            session.google_tokens = new_tokens;
-        }
-        guard.persist().await;
-        return Ok(access_token);
+    // Check bearer token expiry.
+    if chrono::Utc::now().timestamp() >= bearer_session.bearer_expires_at {
+        anyhow::bail!("Bearer token expired");
     }
 
-    unreachable!()
+    let email = &bearer_session.email;
+
+    // Look up user session to get Google tokens.
+    let user_session = store
+        .get_user_session(email)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| anyhow::anyhow!("User session not found"))?;
+
+    if !user_session.google_tokens.is_expired() {
+        return Ok(user_session.google_tokens.access_token.clone());
+    }
+
+    // Google token expired — refresh it.
+    let rt = user_session
+        .google_tokens
+        .refresh_token
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Cannot refresh: no refresh_token available"))?;
+
+    match refresh_google_token(config, rt).await {
+        Ok(new_tokens) => {
+            let access_token = new_tokens.access_token.clone();
+            // Update user_session with new Google tokens.
+            let updated = UserSessionData {
+                google_tokens: new_tokens,
+            };
+            if let Err(e) = store.set_user_session(email, &updated).await {
+                tracing::warn!(error = %e, "failed to update user_session after Google token refresh");
+            }
+            Ok(access_token)
+        }
+        Err(e) => {
+            // H-5: On Google invalid_grant, invalidate the session.
+            if e.to_string().contains("invalid_grant") {
+                tracing::warn!(
+                    email = email,
+                    "Google refresh token invalid, invalidating session"
+                );
+                let _ = store.delete_user_session(email).await;
+                let _ = store.delete_bearer_session(bearer_token).await;
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Look up the user email associated with a bearer token.
 ///
 /// Returns `None` when the bearer token is not found in the store
 /// (e.g. OAuth is disabled or the session has expired).
-pub async fn get_email_for_bearer(store: &Mutex<TokenStore>, bearer_token: &str) -> Option<String> {
-    let guard = store.lock().await;
-    guard
-        .bearer_sessions
-        .get(bearer_token)
-        .map(|s| s.email.clone())
+pub async fn get_email_for_bearer(
+    store: &Arc<dyn StateStore>,
+    bearer_token: &str,
+) -> Option<String> {
+    match store.get_bearer_session(bearer_token).await {
+        Ok(Some(session)) => Some(session.email),
+        _ => None,
+    }
 }
 
 /// Build the Google OAuth authorization URL for the consent screen.
@@ -453,11 +348,7 @@ pub fn build_google_auth_url(config: &OAuthConfig, state: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp_server::session_store::InMemoryPersistence;
-
-    fn test_token_store() -> TokenStore {
-        TokenStore::new(Arc::new(InMemoryPersistence))
-    }
+    use crate::mcp_server::state_store::InMemoryStateStore;
 
     #[test]
     fn test_validate_pkce_s256() {
@@ -529,103 +420,26 @@ mod tests {
         assert!(!tokens.is_expired());
     }
 
-    #[test]
-    fn test_token_store_bearer_sessions() {
-        let mut store = test_token_store();
-        assert!(store.bearer_sessions.get("tok").is_none());
-
-        store.bearer_sessions.insert(
-            "tok".to_string(),
-            UserSession {
-                email: "user@example.com".to_string(),
-                google_tokens: GoogleTokens {
-                    access_token: "gat".to_string(),
-                    refresh_token: None,
-                    expires_at: None,
-                },
-                bearer_expires_at: chrono::Utc::now().timestamp() + 86400,
-            },
-        );
-
-        let session = store.bearer_sessions.get("tok").unwrap();
-        assert_eq!(session.email, "user@example.com");
-        assert_eq!(session.google_tokens.access_token, "gat");
-    }
-
     #[tokio::test]
     async fn test_get_email_for_bearer_found() {
-        let store = tokio::sync::Mutex::new(test_token_store());
-        {
-            let mut guard = store.lock().await;
-            guard.bearer_sessions.insert(
-                "bearer-abc".to_string(),
-                UserSession {
-                    email: "alice@example.com".to_string(),
-                    google_tokens: GoogleTokens {
-                        access_token: "gat".to_string(),
-                        refresh_token: None,
-                        expires_at: None,
-                    },
-                    bearer_expires_at: chrono::Utc::now().timestamp() + 86400,
-                },
-            );
-        }
+        let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+        let session = crate::mcp_server::state_store::BearerSession {
+            email: "alice@example.com".to_string(),
+            bearer_expires_at: chrono::Utc::now().timestamp() + 86400,
+        };
+        store
+            .set_bearer_session("bearer-abc", &session)
+            .await
+            .unwrap();
         let email = get_email_for_bearer(&store, "bearer-abc").await;
         assert_eq!(email.as_deref(), Some("alice@example.com"));
     }
 
     #[tokio::test]
     async fn test_get_email_for_bearer_not_found() {
-        let store = tokio::sync::Mutex::new(test_token_store());
+        let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
         let email = get_email_for_bearer(&store, "nonexistent").await;
         assert!(email.is_none());
-    }
-
-    #[test]
-    fn test_token_store_pending_auth_lifecycle() {
-        let mut store = test_token_store();
-        store.pending_auths.insert(
-            "state1".to_string(),
-            PendingAuth {
-                client_redirect_uri: "https://example.com/callback".to_string(),
-                client_state: Some("cs".to_string()),
-                code_challenge: "cc".to_string(),
-                code_challenge_method: "S256".to_string(),
-                client_id: "client1".to_string(),
-                created_at: chrono::Utc::now().timestamp(),
-            },
-        );
-
-        assert!(store.pending_auths.contains_key("state1"));
-        let auth = store.pending_auths.remove("state1").unwrap();
-        assert_eq!(auth.client_state, Some("cs".to_string()));
-        assert!(store.pending_auths.get("state1").is_none());
-    }
-
-    #[test]
-    fn test_token_store_pending_code_lifecycle() {
-        let mut store = test_token_store();
-        store.pending_codes.insert(
-            "code1".to_string(),
-            PendingCode {
-                session: UserSession {
-                    email: "u@e.com".to_string(),
-                    google_tokens: GoogleTokens {
-                        access_token: "at".to_string(),
-                        refresh_token: Some("rt".to_string()),
-                        expires_at: None,
-                    },
-                    bearer_expires_at: chrono::Utc::now().timestamp() + 86400,
-                },
-                code_challenge: "cc".to_string(),
-                code_challenge_method: "S256".to_string(),
-                created_at: chrono::Utc::now().timestamp(),
-            },
-        );
-
-        let code = store.pending_codes.remove("code1").unwrap();
-        assert_eq!(code.session.email, "u@e.com");
-        assert!(store.pending_codes.get("code1").is_none());
     }
 
     #[test]
@@ -734,59 +548,6 @@ mod tests {
     #[test]
     fn test_validate_gateway_base_url_rejects_http() {
         assert!(validate_gateway_base_url("http://remote.example.com").is_err());
-    }
-
-    #[test]
-    fn test_cleanup_expired() {
-        let mut store = test_token_store();
-        let past = chrono::Utc::now().timestamp() - 10000;
-
-        store.pending_auths.insert(
-            "old".to_string(),
-            PendingAuth {
-                client_redirect_uri: "https://x.com/cb".to_string(),
-                client_state: None,
-                code_challenge: "cc".to_string(),
-                code_challenge_method: "S256".to_string(),
-                client_id: "c".to_string(),
-                created_at: past,
-            },
-        );
-        store.pending_codes.insert(
-            "old_code".to_string(),
-            PendingCode {
-                session: UserSession {
-                    email: "u@e.com".to_string(),
-                    google_tokens: GoogleTokens {
-                        access_token: "at".to_string(),
-                        refresh_token: None,
-                        expires_at: None,
-                    },
-                    bearer_expires_at: past,
-                },
-                code_challenge: "cc".to_string(),
-                code_challenge_method: "S256".to_string(),
-                created_at: past,
-            },
-        );
-        store.bearer_sessions.insert(
-            "old_bearer".to_string(),
-            UserSession {
-                email: "u@e.com".to_string(),
-                google_tokens: GoogleTokens {
-                    access_token: "at".to_string(),
-                    refresh_token: None,
-                    expires_at: None,
-                },
-                bearer_expires_at: past,
-            },
-        );
-
-        store.cleanup_expired();
-
-        assert!(store.pending_auths.is_empty());
-        assert!(store.pending_codes.is_empty());
-        assert!(store.bearer_sessions.is_empty());
     }
 
     #[test]

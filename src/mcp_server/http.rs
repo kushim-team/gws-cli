@@ -1,7 +1,7 @@
 use super::jsonrpc::{build_jsonrpc_response, build_parse_error_response};
-use super::oauth::{self, OAuthConfig, TokenStore};
+use super::oauth::{self, OAuthConfig};
 use super::permissions::{PermissionContext, PermissionsConfig};
-use super::session_store::SessionPersistence;
+use super::state_store::{self, StateStore, StateStoreError};
 use super::*;
 use axum::body::Body;
 use axum::extract::{Query, State};
@@ -14,7 +14,7 @@ struct AppState {
     tools_cache: Mutex<Option<Vec<Value>>>,
     allowed_origins: Vec<String>,
     oauth_config: OAuthConfig,
-    token_store: Mutex<TokenStore>,
+    state_store: Arc<dyn StateStore>,
     permissions: Option<PermissionsConfig>,
 }
 
@@ -25,7 +25,7 @@ pub(super) async fn serve(
     allow_origin: &str,
     oauth_config: OAuthConfig,
     permissions: Option<PermissionsConfig>,
-    persistence: Arc<dyn SessionPersistence>,
+    store: Arc<dyn StateStore>,
 ) -> Result<(), GwsError> {
     let allowed_origins: Vec<String> = if allow_origin.is_empty() {
         vec![]
@@ -36,17 +36,12 @@ pub(super) async fn serve(
             .collect()
     };
 
-    let mut token_store = TokenStore::new(persistence);
-    if let Err(e) = token_store.load_persisted_sessions().await {
-        tracing::warn!(error = %e, "failed to load persisted sessions");
-    }
-
     let state = Arc::new(AppState {
         config,
         tools_cache: Mutex::new(None),
         allowed_origins,
         oauth_config,
-        token_store: Mutex::new(token_store),
+        state_store: store,
         permissions,
     });
 
@@ -139,7 +134,7 @@ async fn resolve_google_token(headers: &HeaderMap, state: &AppState) -> Result<S
     let bearer = extract_bearer_token(headers)
         .ok_or_else(|| unauthorized_response(state, "Authentication required"))?;
 
-    match oauth::get_valid_google_token(&state.oauth_config, &state.token_store, &bearer).await {
+    match oauth::get_valid_google_token(&state.oauth_config, &state.state_store, &bearer).await {
         Ok(token) => Ok(token),
         Err(e) => {
             tracing::warn!("Bearer auth failed: {e}");
@@ -221,7 +216,7 @@ async fn handle_post(
 
     // Resolve user email from bearer token for permission checks and logging.
     let user_email = if !bearer_for_binding.is_empty() {
-        oauth::get_email_for_bearer(&state.token_store, &bearer_for_binding).await
+        oauth::get_email_for_bearer(&state.state_store, &bearer_for_binding).await
     } else {
         None
     };
@@ -372,8 +367,9 @@ async fn handle_authorize(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let oauth_config = &state.oauth_config;
+    let store = &state.state_store;
 
-    // Phase 1-2: client_id is required and must be registered.
+    // client_id is required and must be registered.
     let client_id = match params.get("client_id") {
         Some(id) => id.clone(),
         None => {
@@ -384,50 +380,57 @@ async fn handle_authorize(
             );
         }
     };
-    {
-        let store = state.token_store.lock().await;
-        let client = match store.registered_clients.get(&client_id) {
-            Some(c) => c.clone(),
-            None => {
-                return oauth_error_response(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_client",
-                    "Unknown client_id",
-                );
-            }
-        };
-
-        // Phase 1-2: redirect_uri must be registered.
-        let redirect_uri_param = params.get("redirect_uri");
-        match redirect_uri_param {
-            Some(uri) if !client.redirect_uris.contains(uri) => {
-                return oauth_error_response(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    "redirect_uri not registered for this client",
-                );
-            }
-            None if client.redirect_uris.is_empty() => {
-                return oauth_error_response(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    "Missing redirect_uri and no default registered",
-                );
-            }
-            _ => {}
+    let client = match store.get_registered_client(&client_id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return oauth_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_client",
+                "Unknown client_id",
+            );
         }
+        Err(StateStoreError::Unavailable(_)) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service temporarily unavailable",
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return oauth_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Internal error",
+            );
+        }
+    };
+
+    // redirect_uri must be registered.
+    let redirect_uri_param = params.get("redirect_uri");
+    match redirect_uri_param {
+        Some(uri) if !client.redirect_uris.contains(uri) => {
+            return oauth_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "redirect_uri not registered for this client",
+            );
+        }
+        None if client.redirect_uris.is_empty() => {
+            return oauth_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Missing redirect_uri and no default registered",
+            );
+        }
+        _ => {}
     }
 
     let redirect_uri = match params.get("redirect_uri") {
         Some(u) => u.clone(),
-        None => {
-            let store = state.token_store.lock().await;
-            let client = store.registered_clients.get(&client_id).unwrap();
-            client.redirect_uris[0].clone()
-        }
+        None => client.redirect_uris[0].clone(),
     };
 
-    // Phase 1-1: PKCE is required, S256 only.
+    // PKCE is required, S256 only.
     let code_challenge = match params.get("code_challenge") {
         Some(c) => c.clone(),
         None => {
@@ -455,28 +458,38 @@ async fn handle_authorize(
     // Generate our own state for the Google OAuth redirect.
     let our_state = oauth::generate_secure_token();
 
-    {
-        let mut store = state.token_store.lock().await;
-        // Phase 2-11: cleanup and check capacity.
-        store.cleanup_expired();
-        if store.is_pending_auths_full() {
-            return oauth_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_error",
-                "Too many pending authorizations",
-            );
+    let pending = state_store::PendingAuth {
+        client_redirect_uri: redirect_uri,
+        client_state,
+        code_challenge,
+        code_challenge_method,
+        client_id,
+        created_at: chrono::Utc::now().timestamp(),
+    };
+    if let Err(e) = store.set_pending_auth(&our_state, &pending).await {
+        match e {
+            StateStoreError::CapacityExceeded(_) => {
+                return oauth_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server_error",
+                    "Too many pending authorizations",
+                );
+            }
+            StateStoreError::Unavailable(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Service temporarily unavailable",
+                )
+                    .into_response();
+            }
+            _ => {
+                return oauth_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "Internal error",
+                );
+            }
         }
-        store.pending_auths.insert(
-            our_state.clone(),
-            oauth::PendingAuth {
-                client_redirect_uri: redirect_uri,
-                client_state,
-                code_challenge,
-                code_challenge_method,
-                client_id,
-                created_at: chrono::Utc::now().timestamp(),
-            },
-        );
     }
 
     let google_url = oauth::build_google_auth_url(oauth_config, &our_state);
@@ -500,49 +513,92 @@ fn oauth_error_response(status: StatusCode, error: &str, description: &str) -> R
         .into_response()
 }
 
+/// Build an error redirect back to the client with ?error=...&state=...
+fn build_error_redirect(redirect_uri: &str, error: &str, client_state: Option<&str>) -> Response {
+    let mut redirect = redirect_uri.to_string();
+    let sep = if redirect.contains('?') { "&" } else { "?" };
+    let encoded_error =
+        percent_encoding::utf8_percent_encode(error, percent_encoding::NON_ALPHANUMERIC);
+    redirect.push_str(&format!("{sep}error={encoded_error}"));
+    if let Some(cs) = client_state {
+        redirect.push_str(&format!(
+            "&state={}",
+            percent_encoding::utf8_percent_encode(cs, percent_encoding::NON_ALPHANUMERIC)
+        ));
+    }
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header("location", redirect)
+        .body(Body::empty())
+        .unwrap()
+}
+
 /// GET /oauth/callback — Google redirects here after user consent.
 async fn handle_oauth_callback(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let oauth_config = &state.oauth_config;
-
-    let google_code = match params.get("code") {
-        Some(c) => c.clone(),
-        None => {
-            let error = params.get("error").map(|s| s.as_str()).unwrap_or("unknown");
-            return (StatusCode::BAD_REQUEST, format!("OAuth error: {error}")).into_response();
-        }
-    };
+    let store = &state.state_store;
 
     let our_state = match params.get("state") {
         Some(s) => s.clone(),
         None => return (StatusCode::BAD_REQUEST, "Missing state parameter").into_response(),
     };
 
-    // Look up pending auth and check TTL.
-    let pending = {
-        let mut store = state.token_store.lock().await;
-        store.pending_auths.remove(&our_state)
-    };
-
-    let pending = match pending {
-        Some(p) => {
-            // Phase 2-2: pending_auths TTL check.
-            if chrono::Utc::now().timestamp() - p.created_at > oauth::PENDING_AUTH_TTL_SECS {
+    // Look up and consume the pending auth.
+    let pending = match store.take_pending_auth(&our_state).await {
+        Ok(Some(p)) => {
+            // TTL check.
+            if chrono::Utc::now().timestamp() - p.created_at > state_store::PENDING_AUTH_TTL_SECS {
                 return (StatusCode::BAD_REQUEST, "Authorization request expired").into_response();
             }
             p
         }
-        None => return (StatusCode::BAD_REQUEST, "Unknown or expired state").into_response(),
+        Ok(None) => return (StatusCode::BAD_REQUEST, "Unknown or expired state").into_response(),
+        Err(StateStoreError::Unavailable(_)) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service temporarily unavailable",
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+        }
+    };
+
+    // H-7: Check if Google returned an error (e.g. user denied consent).
+    if let Some(error) = params.get("error") {
+        return build_error_redirect(
+            &pending.client_redirect_uri,
+            error,
+            pending.client_state.as_deref(),
+        );
+    }
+
+    let google_code = match params.get("code") {
+        Some(c) => c.clone(),
+        None => {
+            return build_error_redirect(
+                &pending.client_redirect_uri,
+                "server_error",
+                pending.client_state.as_deref(),
+            );
+        }
     };
 
     // Exchange Google code for tokens.
     let google_tokens = match oauth::exchange_google_code(oauth_config, &google_code).await {
         Ok(t) => t,
         Err(e) => {
+            // H-7: redirect with error on code exchange failure.
             tracing::error!(error = %e, "google token exchange failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Token exchange failed").into_response();
+            return build_error_redirect(
+                &pending.client_redirect_uri,
+                "server_error",
+                pending.client_state.as_deref(),
+            );
         }
     };
 
@@ -550,8 +606,13 @@ async fn handle_oauth_callback(
     let email = match oauth::get_google_userinfo(&google_tokens.access_token).await {
         Ok(e) => e,
         Err(e) => {
+            // H-7: redirect with error on userinfo failure.
             tracing::error!(error = %e, "failed to get userinfo");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to identify user").into_response();
+            return build_error_redirect(
+                &pending.client_redirect_uri,
+                "server_error",
+                pending.client_state.as_deref(),
+            );
         }
     };
 
@@ -559,26 +620,29 @@ async fn handle_oauth_callback(
 
     // Generate our auth code for the client.
     let our_code = oauth::generate_secure_token();
-    {
-        let mut store = state.token_store.lock().await;
-        store.cleanup_expired();
-        if store.is_pending_codes_full() {
-            return (StatusCode::SERVICE_UNAVAILABLE, "Too many pending codes").into_response();
+    let pending_code = state_store::PendingCode {
+        email,
+        google_tokens,
+        code_challenge: pending.code_challenge,
+        code_challenge_method: pending.code_challenge_method,
+        created_at: chrono::Utc::now().timestamp(),
+    };
+    if let Err(e) = store.set_pending_code(&our_code, &pending_code).await {
+        match e {
+            StateStoreError::CapacityExceeded(_) => {
+                return (StatusCode::SERVICE_UNAVAILABLE, "Too many pending codes").into_response();
+            }
+            StateStoreError::Unavailable(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Service temporarily unavailable",
+                )
+                    .into_response();
+            }
+            _ => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+            }
         }
-        store.pending_codes.insert(
-            our_code.clone(),
-            oauth::PendingCode {
-                session: oauth::UserSession {
-                    email,
-                    google_tokens,
-                    bearer_expires_at: chrono::Utc::now().timestamp()
-                        + oauth::BEARER_TOKEN_LIFETIME_SECS,
-                },
-                code_challenge: pending.code_challenge,
-                code_challenge_method: pending.code_challenge_method,
-                created_at: chrono::Utc::now().timestamp(),
-            },
-        );
     }
 
     // Redirect back to the client with our auth code (url-encoded).
@@ -643,6 +707,8 @@ async fn handle_token_authorization_code(
     params: &HashMap<String, String>,
     cors_headers: HeaderMap,
 ) -> Response {
+    let store = &state.state_store;
+
     let code = match params.get("code") {
         Some(c) => c.clone(),
         None => {
@@ -650,16 +716,11 @@ async fn handle_token_authorization_code(
         }
     };
 
-    // Take the pending code.
-    let pending_code = {
-        let mut store = state.token_store.lock().await;
-        store.pending_codes.remove(&code)
-    };
-
-    let pending_code = match pending_code {
-        Some(pc) => {
-            // Phase 2-1: auth code TTL check (10 minutes).
-            if chrono::Utc::now().timestamp() - pc.created_at > oauth::AUTH_CODE_TTL_SECS {
+    // Take the pending code (atomic remove).
+    let pending_code = match store.take_pending_code(&code).await {
+        Ok(Some(pc)) => {
+            // Auth code TTL check (10 minutes).
+            if chrono::Utc::now().timestamp() - pc.created_at > state_store::AUTH_CODE_TTL_SECS {
                 return token_error_response(
                     "invalid_grant",
                     "Authorization code expired",
@@ -668,12 +729,22 @@ async fn handle_token_authorization_code(
             }
             pc
         }
-        None => {
+        Ok(None) => {
             return token_error_response(
                 "invalid_grant",
                 "Invalid authorization code",
                 cors_headers,
             );
+        }
+        Err(StateStoreError::Unavailable(_)) => {
+            return token_error_response(
+                "server_error",
+                "Service temporarily unavailable",
+                cors_headers,
+            );
+        }
+        Err(_) => {
+            return token_error_response("server_error", "Internal error", cors_headers);
         }
     };
 
@@ -695,20 +766,41 @@ async fn handle_token_authorization_code(
     // Issue bearer token and refresh token with 256-bit entropy each.
     let bearer_token = oauth::generate_secure_token();
     let refresh_token = oauth::generate_secure_token();
-    let expires_in = oauth::BEARER_TOKEN_LIFETIME_SECS;
-    {
-        let mut store = state.token_store.lock().await;
-        store.cleanup_expired();
-        if store.is_bearer_sessions_full() {
-            return token_error_response("server_error", "Too many active sessions", cors_headers);
+    let now = chrono::Utc::now().timestamp();
+    let bearer_expires_at = now + state_store::BEARER_TOKEN_LIFETIME_SECS;
+    let refresh_expires_at = now + state_store::REFRESH_TOKEN_LIFETIME_SECS;
+
+    // H-6: Atomic transaction — create user_session, bearer_session, refresh_token.
+    let input = state_store::CodeExchangeInput {
+        auth_code: code,
+        email: pending_code.email,
+        google_tokens: pending_code.google_tokens,
+        bearer_token: bearer_token.clone(),
+        bearer_expires_at,
+        refresh_token: refresh_token.clone(),
+        refresh_expires_at,
+    };
+    if let Err(e) = store.exchange_code_transaction(input).await {
+        match e {
+            StateStoreError::CapacityExceeded(_) => {
+                return token_error_response(
+                    "server_error",
+                    "Too many active sessions",
+                    cors_headers,
+                );
+            }
+            StateStoreError::Unavailable(_) => {
+                return token_error_response(
+                    "server_error",
+                    "Service temporarily unavailable",
+                    cors_headers,
+                );
+            }
+            _ => {
+                tracing::error!(error = %e, "code exchange transaction failed");
+                return token_error_response("server_error", "Internal error", cors_headers);
+            }
         }
-        store
-            .bearer_sessions
-            .insert(bearer_token.clone(), pending_code.session);
-        store
-            .refresh_to_bearer
-            .insert(refresh_token.clone(), bearer_token.clone());
-        store.persist().await;
     }
 
     let mut resp_headers = cors_headers;
@@ -724,7 +816,7 @@ async fn handle_token_authorization_code(
     let resp_body = json!({
         "access_token": bearer_token,
         "token_type": "Bearer",
-        "expires_in": expires_in,
+        "expires_in": state_store::BEARER_TOKEN_LIFETIME_SECS,
         "refresh_token": refresh_token,
     });
 
@@ -742,6 +834,8 @@ async fn handle_token_refresh(
     params: &HashMap<String, String>,
     cors_headers: HeaderMap,
 ) -> Response {
+    let store = &state.state_store;
+
     let old_refresh = match params.get("refresh_token") {
         Some(t) => t.clone(),
         None => {
@@ -749,32 +843,53 @@ async fn handle_token_refresh(
         }
     };
 
-    // Look up the bearer token associated with this refresh token, then the session.
-    let session = {
-        let mut store = state.token_store.lock().await;
-        let old_bearer = match store.refresh_to_bearer.remove(&old_refresh) {
-            Some(b) => b,
-            None => {
+    // Look up the refresh token entry.
+    let refresh_entry = match store.get_refresh_entry(&old_refresh).await {
+        Ok(Some(entry)) => {
+            // H-3: Check refresh token expiry.
+            if chrono::Utc::now().timestamp() >= entry.refresh_expires_at {
+                let _ = store.delete_refresh_entry(&old_refresh).await;
                 return token_error_response(
                     "invalid_grant",
-                    "Unknown refresh token",
+                    "Refresh token expired",
                     cors_headers,
                 );
             }
-        };
-        store.bearer_sessions.remove(&old_bearer)
+            entry
+        }
+        Ok(None) => {
+            return token_error_response("invalid_grant", "Unknown refresh token", cors_headers);
+        }
+        Err(StateStoreError::Unavailable(_)) => {
+            return token_error_response(
+                "server_error",
+                "Service temporarily unavailable",
+                cors_headers,
+            );
+        }
+        Err(_) => {
+            return token_error_response("server_error", "Internal error", cors_headers);
+        }
     };
 
-    let mut session = match session {
-        Some(s) => s,
-        None => {
+    let email = &refresh_entry.email;
+
+    // Look up the user session to check if Google token refresh is needed.
+    let user_session = match store.get_user_session(email).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            // User session gone — treat as invalid_grant.
+            let _ = store.delete_refresh_entry(&old_refresh).await;
             return token_error_response("invalid_grant", "Session expired", cors_headers);
+        }
+        Err(_) => {
+            return token_error_response("server_error", "Internal error", cors_headers);
         }
     };
 
     // Refresh Google token if needed.
-    if session.google_tokens.is_expired() {
-        let rt = match &session.google_tokens.refresh_token {
+    let updated_google_tokens = if user_session.google_tokens.is_expired() {
+        let rt = match &user_session.google_tokens.refresh_token {
             Some(rt) => rt.clone(),
             None => {
                 return token_error_response(
@@ -785,8 +900,22 @@ async fn handle_token_refresh(
             }
         };
         match oauth::refresh_google_token(oauth_config, &rt).await {
-            Ok(new_tokens) => session.google_tokens = new_tokens,
-            Err(_) => {
+            Ok(new_tokens) => Some(new_tokens),
+            Err(e) => {
+                // H-5: On Google invalid_grant, invalidate the session.
+                if e.to_string().contains("invalid_grant") {
+                    tracing::warn!(
+                        email = email,
+                        "Google refresh token invalid, invalidating session"
+                    );
+                    let _ = store.delete_user_session(email).await;
+                    let _ = store.delete_refresh_entry(&old_refresh).await;
+                    return token_error_response(
+                        "invalid_grant",
+                        "Google token revoked, please re-authorize",
+                        cors_headers,
+                    );
+                }
                 return token_error_response(
                     "invalid_grant",
                     "Failed to refresh Google token",
@@ -794,25 +923,53 @@ async fn handle_token_refresh(
                 );
             }
         }
-    }
+    } else {
+        None
+    };
 
     // Issue new bearer token and new refresh token.
     let new_bearer = oauth::generate_secure_token();
     let new_refresh = oauth::generate_secure_token();
-    let expires_in = oauth::BEARER_TOKEN_LIFETIME_SECS;
-    session.bearer_expires_at = chrono::Utc::now().timestamp() + expires_in;
+    let now = chrono::Utc::now().timestamp();
+    let bearer_expires_at = now + state_store::BEARER_TOKEN_LIFETIME_SECS;
+    let refresh_expires_at = now + state_store::REFRESH_TOKEN_LIFETIME_SECS;
 
-    {
-        let mut store = state.token_store.lock().await;
-        store.cleanup_expired();
-        if store.is_bearer_sessions_full() {
-            return token_error_response("server_error", "Too many active sessions", cors_headers);
+    // Find the old bearer session associated with this email (best-effort lookup).
+    // We pass None since we don't track the mapping from refresh→bearer in the new model.
+    let old_bearer_token = None;
+
+    // H-6: Atomic transaction — rotate bearer + refresh tokens.
+    let input = state_store::RefreshTransactionInput {
+        old_refresh_token: old_refresh,
+        old_bearer_token,
+        email: email.clone(),
+        new_bearer_token: new_bearer.clone(),
+        bearer_expires_at,
+        new_refresh_token: new_refresh.clone(),
+        refresh_expires_at,
+        updated_google_tokens,
+    };
+    if let Err(e) = store.refresh_token_transaction(input).await {
+        match e {
+            StateStoreError::CapacityExceeded(_) => {
+                return token_error_response(
+                    "server_error",
+                    "Too many active sessions",
+                    cors_headers,
+                );
+            }
+            StateStoreError::Unavailable(_) => {
+                return token_error_response(
+                    "server_error",
+                    "Service temporarily unavailable",
+                    cors_headers,
+                );
+            }
+            _ => {
+                tracing::error!(error = %e, "refresh token transaction failed");
+                return token_error_response("server_error", "Internal error", cors_headers);
+            }
         }
-        store.bearer_sessions.insert(new_bearer.clone(), session);
-        store
-            .refresh_to_bearer
-            .insert(new_refresh.clone(), new_bearer.clone());
-        store.persist().await;
     }
 
     let mut resp_headers = cors_headers;
@@ -828,7 +985,7 @@ async fn handle_token_refresh(
     let resp_body = json!({
         "access_token": new_bearer,
         "token_type": "Bearer",
-        "expires_in": expires_in,
+        "expires_in": state_store::BEARER_TOKEN_LIFETIME_SECS,
         "refresh_token": new_refresh,
     });
 
@@ -841,13 +998,18 @@ async fn handle_token_refresh(
 }
 
 fn token_error_response(error: &str, description: &str, cors_headers: HeaderMap) -> Response {
+    let status = if error == "server_error" {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::BAD_REQUEST
+    };
     let mut resp_headers = cors_headers;
     resp_headers.insert(
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
     (
-        StatusCode::BAD_REQUEST,
+        status,
         resp_headers,
         json!({"error": error, "error_description": description}).to_string(),
     )
@@ -860,6 +1022,7 @@ async fn handle_register(
     headers: HeaderMap,
     body: String,
 ) -> Response {
+    let store = &state.state_store;
     let cors_headers = build_cors_headers(&headers, &state.allowed_origins);
 
     #[derive(serde::Deserialize)]
@@ -879,7 +1042,7 @@ async fn handle_register(
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid registration request").into_response(),
     };
 
-    // Phase 2-3: validate redirect_uri schemes.
+    // Validate redirect_uri schemes.
     for uri in &req.redirect_uris {
         if let Err(e) = oauth::validate_redirect_uri(uri) {
             let mut resp_headers = cors_headers;
@@ -898,23 +1061,33 @@ async fn handle_register(
 
     let client_id = oauth::generate_secure_token();
     let now = chrono::Utc::now().timestamp();
-    let client = oauth::RegisteredClient {
+    let client = state_store::RegisteredClient {
         client_id: client_id.clone(),
         redirect_uris: req.redirect_uris.clone(),
         client_name: req.client_name.clone(),
         client_id_issued_at: now,
     };
 
-    {
-        let mut store = state.token_store.lock().await;
-        if store.is_registered_clients_full() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Too many registered clients",
-            )
-                .into_response();
+    if let Err(e) = store.set_registered_client(&client_id, &client).await {
+        match e {
+            StateStoreError::CapacityExceeded(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Too many registered clients",
+                )
+                    .into_response();
+            }
+            StateStoreError::Unavailable(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Service temporarily unavailable",
+                )
+                    .into_response();
+            }
+            _ => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+            }
         }
-        store.registered_clients.insert(client_id.clone(), client);
     }
 
     let mut resp_headers = cors_headers;
@@ -994,12 +1167,38 @@ mod tests {
         }
     }
 
+    async fn make_test_store() -> Arc<dyn StateStore> {
+        let store: Arc<dyn StateStore> = Arc::new(state_store::InMemoryStateStore::new());
+        // Pre-register a bearer session and user session for tests that need auth.
+        let user_session = state_store::UserSessionData {
+            google_tokens: oauth::GoogleTokens {
+                access_token: "google-at".to_string(),
+                refresh_token: None,
+                expires_at: Some(chrono::Utc::now().timestamp() + 3600),
+            },
+        };
+        store
+            .set_user_session("user@corp.com", &user_session)
+            .await
+            .unwrap();
+        let bearer_session = state_store::BearerSession {
+            email: "user@corp.com".to_string(),
+            bearer_expires_at: chrono::Utc::now().timestamp() + 86400,
+        };
+        store
+            .set_bearer_session(TEST_BEARER, &bearer_session)
+            .await
+            .unwrap();
+        store
+    }
+
     async fn test_state() -> Arc<AppState> {
         test_state_with_origins(vec![]).await
     }
 
     async fn test_state_with_origins(allowed_origins: Vec<String>) -> Arc<AppState> {
-        let state = Arc::new(AppState {
+        let store = make_test_store().await;
+        Arc::new(AppState {
             config: ServerConfig {
                 services: vec![],
                 workflows: false,
@@ -1009,19 +1208,9 @@ mod tests {
             tools_cache: Mutex::new(None),
             allowed_origins,
             oauth_config: test_oauth_config(),
-            token_store: Mutex::new(TokenStore::new(Arc::new(
-                super::session_store::InMemoryPersistence,
-            ))),
+            state_store: store,
             permissions: None,
-        });
-        // Pre-register a bearer session for tests that need auth.
-        state
-            .token_store
-            .lock()
-            .await
-            .bearer_sessions
-            .insert(TEST_BEARER.to_string(), make_bearer_session());
-        state
+        })
     }
 
     async fn test_state_with_oauth() -> Arc<AppState> {
@@ -1441,33 +1630,19 @@ mod tests {
         result["client_id"].as_str().unwrap().to_string()
     }
 
-    fn make_pending_code(challenge: String) -> oauth::PendingCode {
-        oauth::PendingCode {
-            session: oauth::UserSession {
-                email: "user@test.com".to_string(),
-                google_tokens: oauth::GoogleTokens {
-                    access_token: "google-at".to_string(),
-                    refresh_token: Some("google-rt".to_string()),
-                    expires_at: Some(chrono::Utc::now().timestamp() + 3600),
-                },
-                bearer_expires_at: chrono::Utc::now().timestamp() + 86400,
+    async fn make_pending_code(store: &Arc<dyn StateStore>, code: &str, challenge: String) {
+        let pc = state_store::PendingCode {
+            email: "user@test.com".to_string(),
+            google_tokens: oauth::GoogleTokens {
+                access_token: "google-at".to_string(),
+                refresh_token: Some("google-rt".to_string()),
+                expires_at: Some(chrono::Utc::now().timestamp() + 3600),
             },
             code_challenge: challenge,
             code_challenge_method: "S256".to_string(),
             created_at: chrono::Utc::now().timestamp(),
-        }
-    }
-
-    fn make_bearer_session() -> oauth::UserSession {
-        oauth::UserSession {
-            email: "user@corp.com".to_string(),
-            google_tokens: oauth::GoogleTokens {
-                access_token: "google-at".to_string(),
-                refresh_token: None,
-                expires_at: Some(chrono::Utc::now().timestamp() + 3600),
-            },
-            bearer_expires_at: chrono::Utc::now().timestamp() + 86400,
-        }
+        };
+        store.set_pending_code(code, &pc).await.unwrap();
     }
 
     #[tokio::test]
@@ -1493,9 +1668,7 @@ mod tests {
             "https://gw.example.com/authorize"
         );
         assert_eq!(meta["token_endpoint"], "https://gw.example.com/token");
-        // Phase 3-1: scopes_supported
         assert!(meta["scopes_supported"].is_array());
-        // Phase 2-7: refresh_token in grant_types
         let grant_types = meta["grant_types_supported"].as_array().unwrap();
         assert!(grant_types.contains(&json!("refresh_token")));
     }
@@ -1658,12 +1831,7 @@ mod tests {
             oauth::base64_url_encode(&digest)
         };
 
-        {
-            let mut store = state.token_store.lock().await;
-            store
-                .pending_codes
-                .insert("test-code".to_string(), make_pending_code(challenge));
-        }
+        make_pending_code(&state.state_store, "test-code", challenge).await;
 
         let app = test_app(state.clone());
         let body_str =
@@ -1682,7 +1850,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let result: Value = serde_json::from_slice(&bytes).unwrap();
-        // Phase 1-5: token_type is "Bearer" (capital B) and expires_in is present
         assert_eq!(result["token_type"], "Bearer");
         assert!(result["expires_in"].as_i64().unwrap() > 0);
         assert!(result["access_token"].as_str().is_some());
@@ -1693,11 +1860,22 @@ mod tests {
         // access_token and refresh_token must be distinct values.
         assert_ne!(bearer, refresh);
 
-        let store = state.token_store.lock().await;
-        let session = store.bearer_sessions.get(bearer).unwrap();
-        assert_eq!(session.email, "user@test.com");
-        // refresh_to_bearer mapping must exist.
-        assert_eq!(store.refresh_to_bearer.get(refresh).unwrap(), bearer);
+        // Verify bearer_session was created.
+        let bearer_session = state
+            .state_store
+            .get_bearer_session(bearer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bearer_session.email, "user@test.com");
+        // Verify refresh_token entry was created.
+        let refresh_entry = state
+            .state_store
+            .get_refresh_entry(refresh)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refresh_entry.email, "user@test.com");
     }
 
     #[tokio::test]
@@ -1709,12 +1887,24 @@ mod tests {
             let digest = sha2::Sha256::digest(verifier.as_bytes());
             oauth::base64_url_encode(&digest)
         };
-        {
-            let mut store = state.token_store.lock().await;
-            let mut pc = make_pending_code(challenge);
-            pc.created_at = chrono::Utc::now().timestamp() - 700; // expired (>600s)
-            store.pending_codes.insert("expired-code".to_string(), pc);
-        }
+        // Insert an expired pending code.
+        let pc = state_store::PendingCode {
+            email: "user@test.com".to_string(),
+            google_tokens: oauth::GoogleTokens {
+                access_token: "google-at".to_string(),
+                refresh_token: Some("google-rt".to_string()),
+                expires_at: Some(chrono::Utc::now().timestamp() + 3600),
+            },
+            code_challenge: challenge,
+            code_challenge_method: "S256".to_string(),
+            created_at: chrono::Utc::now().timestamp() - 700, // expired (>600s)
+        };
+        state
+            .state_store
+            .set_pending_code("expired-code", &pc)
+            .await
+            .unwrap();
+
         let app = test_app(state);
         let resp = app
             .oneshot(
@@ -1738,13 +1928,13 @@ mod tests {
     #[tokio::test]
     async fn test_token_exchange_pkce_failure() {
         let state = test_state_with_oauth().await;
-        {
-            let mut store = state.token_store.lock().await;
-            store.pending_codes.insert(
-                "code2".to_string(),
-                make_pending_code("expected-challenge".to_string()),
-            );
-        }
+        make_pending_code(
+            &state.state_store,
+            "code2",
+            "expected-challenge".to_string(),
+        )
+        .await;
+
         let app = test_app(state);
         let resp = app
             .oneshot(
@@ -1768,18 +1958,38 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_token_grant() {
         let state = test_state_with_oauth().await;
-        // Set up a bearer session with a corresponding refresh token.
+        let store = &state.state_store;
+        // Set up a user session, bearer session, and refresh token.
+        let user_session = state_store::UserSessionData {
+            google_tokens: oauth::GoogleTokens {
+                access_token: "google-at".to_string(),
+                refresh_token: None,
+                expires_at: Some(chrono::Utc::now().timestamp() + 3600),
+            },
+        };
+        store
+            .set_user_session("user@corp.com", &user_session)
+            .await
+            .unwrap();
         let old_bearer = "old-bearer-tok";
         let old_refresh = "old-refresh-tok";
-        {
-            let mut store = state.token_store.lock().await;
-            store
-                .bearer_sessions
-                .insert(old_bearer.to_string(), make_bearer_session());
-            store
-                .refresh_to_bearer
-                .insert(old_refresh.to_string(), old_bearer.to_string());
-        }
+        let bearer_session = state_store::BearerSession {
+            email: "user@corp.com".to_string(),
+            bearer_expires_at: chrono::Utc::now().timestamp() + 86400,
+        };
+        store
+            .set_bearer_session(old_bearer, &bearer_session)
+            .await
+            .unwrap();
+        let refresh_entry = state_store::RefreshTokenEntry {
+            email: "user@corp.com".to_string(),
+            refresh_expires_at: chrono::Utc::now().timestamp()
+                + state_store::REFRESH_TOKEN_LIFETIME_SECS,
+        };
+        store
+            .set_refresh_entry(old_refresh, &refresh_entry)
+            .await
+            .unwrap();
 
         let app = test_app(state.clone());
         let body_str = format!("grant_type=refresh_token&refresh_token={old_refresh}");
@@ -1807,16 +2017,23 @@ mod tests {
         // access_token and refresh_token must be distinct.
         assert_ne!(new_bearer, new_refresh);
 
-        let store = state.token_store.lock().await;
-        // Old bearer and refresh must be removed.
-        assert!(!store.bearer_sessions.contains_key(old_bearer));
-        assert!(!store.refresh_to_bearer.contains_key(old_refresh));
+        // Old refresh must be removed.
+        assert!(store
+            .get_refresh_entry(old_refresh)
+            .await
+            .unwrap()
+            .is_none());
         // New ones must exist.
-        assert!(store.bearer_sessions.contains_key(new_bearer));
-        assert_eq!(
-            store.refresh_to_bearer.get(new_refresh).unwrap(),
-            new_bearer
-        );
+        assert!(store
+            .get_bearer_session(new_bearer)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_refresh_entry(new_refresh)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -1864,7 +2081,6 @@ mod tests {
         let result: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(result["client_id"].as_str().is_some());
         assert_eq!(result["client_name"], "Claude");
-        // Phase 3-2: client_id_issued_at
         assert!(result["client_id_issued_at"].as_i64().is_some());
     }
 
@@ -1908,9 +2124,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        // Phase 2-6: WWW-Authenticate header present on 401
         assert!(resp.headers().get("www-authenticate").is_some());
-        // Phase 2-5: absolute URL in resource_metadata
         let www_auth = resp
             .headers()
             .get("www-authenticate")
@@ -1923,12 +2137,29 @@ mod tests {
     #[tokio::test]
     async fn test_mcp_post_with_valid_bearer_token() {
         let state = test_state_with_oauth().await;
-        {
-            let mut store = state.token_store.lock().await;
-            store
-                .bearer_sessions
-                .insert("valid-bearer".to_string(), make_bearer_session());
-        }
+        // Add a second bearer session
+        let user_session = state_store::UserSessionData {
+            google_tokens: oauth::GoogleTokens {
+                access_token: "google-at".to_string(),
+                refresh_token: None,
+                expires_at: Some(chrono::Utc::now().timestamp() + 3600),
+            },
+        };
+        state
+            .state_store
+            .set_user_session("user@corp.com", &user_session)
+            .await
+            .unwrap();
+        let bearer_session = state_store::BearerSession {
+            email: "user@corp.com".to_string(),
+            bearer_expires_at: chrono::Utc::now().timestamp() + 86400,
+        };
+        state
+            .state_store
+            .set_bearer_session("valid-bearer", &bearer_session)
+            .await
+            .unwrap();
+
         let app = test_app(state);
         let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
         let resp = app
