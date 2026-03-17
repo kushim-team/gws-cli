@@ -42,12 +42,25 @@ impl std::fmt::Debug for OAuthConfig {
 }
 
 /// Stored Google OAuth tokens for a user.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct GoogleTokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
     /// Unix timestamp when the access token expires.
     pub expires_at: Option<i64>,
+}
+
+impl std::fmt::Debug for GoogleTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleTokens")
+            .field("access_token", &"[REDACTED]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl GoogleTokens {
@@ -67,16 +80,31 @@ pub fn generate_secure_token() -> String {
     base64_url_encode(&buf)
 }
 
+/// Check if a URL's host portion is a localhost variant.
+/// Returns true if the host is exactly "localhost", "127.0.0.1", or "[::1]".
+fn is_localhost_url(lower: &str) -> bool {
+    for prefix in &["http://localhost", "http://127.0.0.1", "http://[::1]"] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            if rest.is_empty()
+                || rest.starts_with(':')
+                || rest.starts_with('/')
+                || rest.starts_with('?')
+                || rest.starts_with('#')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Validate that a redirect URI has a safe scheme.
 pub fn validate_redirect_uri(uri: &str) -> Result<(), String> {
     let lower = uri.to_lowercase();
     if lower.starts_with("https://") {
         return Ok(());
     }
-    if lower.starts_with("http://localhost")
-        || lower.starts_with("http://127.0.0.1")
-        || lower.starts_with("http://[::1]")
-    {
+    if is_localhost_url(&lower) {
         return Ok(());
     }
     Err(format!(
@@ -90,10 +118,7 @@ pub fn validate_gateway_base_url(url: &str) -> Result<(), String> {
     if lower.starts_with("https://") {
         return Ok(());
     }
-    if lower.starts_with("http://localhost")
-        || lower.starts_with("http://127.0.0.1")
-        || lower.starts_with("http://[::1]")
-    {
+    if is_localhost_url(&lower) {
         return Ok(());
     }
     Err(format!(
@@ -220,12 +245,14 @@ pub async fn get_google_userinfo(access_token: &str) -> anyhow::Result<String> {
 
 /// Validate a PKCE `code_verifier` against the stored `code_challenge`.
 /// Only S256 is supported; plain is rejected.
+/// Uses constant-time comparison to prevent timing attacks.
 pub fn validate_pkce(code_verifier: &str, code_challenge: &str, method: Option<&str>) -> bool {
+    use subtle::ConstantTimeEq;
     match method.unwrap_or("S256") {
         "S256" => {
             let digest = sha2::Sha256::digest(code_verifier.as_bytes());
             let computed = base64_url_encode(&digest);
-            computed == code_challenge
+            computed.as_bytes().ct_eq(code_challenge.as_bytes()).into()
         }
         _ => false,
     }

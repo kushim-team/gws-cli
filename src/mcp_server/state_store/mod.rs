@@ -59,6 +59,10 @@ pub struct BearerSession {
 pub struct RefreshTokenEntry {
     pub email: String,
     pub refresh_expires_at: i64,
+    /// The bearer token associated with this refresh token,
+    /// used to invalidate the old bearer on refresh.
+    #[serde(default)]
+    pub bearer_token: Option<String>,
 }
 
 /// State tracked between `/authorize` redirect and `/oauth/callback`.

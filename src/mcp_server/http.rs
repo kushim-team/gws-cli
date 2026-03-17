@@ -57,6 +57,8 @@ pub(super) async fn serve(
         .route("/oauth/callback", get(handle_oauth_callback))
         .route("/token", post(handle_token))
         .route("/register", post(handle_register))
+        .layer(axum::extract::DefaultBodyLimit::max(1_048_576))
+        .layer(axum::middleware::from_fn(security_headers_middleware))
         .with_state(state);
 
     let addr: std::net::SocketAddr = format!("{host}:{port}")
@@ -77,6 +79,24 @@ pub(super) async fn serve(
 
 // ---- helpers ----
 
+async fn security_headers_middleware(
+    request: axum::http::Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        "X-Content-Type-Options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
+    headers.insert(
+        "Strict-Transport-Security",
+        HeaderValue::from_static("max-age=63072000; includeSubDomains"),
+    );
+    response
+}
+
 fn get_session_id(headers: &HeaderMap) -> Option<String> {
     headers
         .get("mcp-session-id")
@@ -93,12 +113,33 @@ fn validate_origin(headers: &HeaderMap, allowed_origins: &[String]) -> bool {
         return allowed_origins.iter().any(|a| a == origin);
     }
     let lower = origin.to_lowercase();
-    lower.starts_with("http://localhost")
-        || lower.starts_with("https://localhost")
-        || lower.starts_with("http://127.0.0.1")
-        || lower.starts_with("https://127.0.0.1")
-        || lower.starts_with("http://[::1]")
-        || lower.starts_with("https://[::1]")
+    is_localhost_origin(&lower)
+}
+
+/// Check if an origin is a localhost variant (http or https).
+/// Ensures the host is exactly "localhost", "127.0.0.1", or "[::1]"
+/// (not e.g. "localhost.evil.com").
+fn is_localhost_origin(lower: &str) -> bool {
+    for prefix in &[
+        "http://localhost",
+        "https://localhost",
+        "http://127.0.0.1",
+        "https://127.0.0.1",
+        "http://[::1]",
+        "https://[::1]",
+    ] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            if rest.is_empty()
+                || rest.starts_with(':')
+                || rest.starts_with('/')
+                || rest.starts_with('?')
+                || rest.starts_with('#')
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Extract bearer token from Authorization header.
@@ -273,9 +314,13 @@ async fn handle_post(
 
     let mut resp_headers = HeaderMap::new();
     if let Some(ref sid) = new_session_id {
-        resp_headers.insert("mcp-session-id", HeaderValue::from_str(sid).unwrap());
+        if let Ok(v) = HeaderValue::from_str(sid) {
+            resp_headers.insert("mcp-session-id", v);
+        }
     } else if let Some(sid) = get_session_id(&headers) {
-        resp_headers.insert("mcp-session-id", HeaderValue::from_str(&sid).unwrap());
+        if let Ok(v) = HeaderValue::from_str(&sid) {
+            resp_headers.insert("mcp-session-id", v);
+        }
     }
     resp_headers.insert(
         axum::http::header::CONTENT_TYPE,
@@ -910,6 +955,9 @@ async fn handle_token_refresh(
                     );
                     let _ = store.delete_user_session(email).await;
                     let _ = store.delete_refresh_entry(&old_refresh).await;
+                    if let Some(ref bt) = refresh_entry.bearer_token {
+                        let _ = store.delete_bearer_session(bt).await;
+                    }
                     return token_error_response(
                         "invalid_grant",
                         "Google token revoked, please re-authorize",
@@ -934,9 +982,8 @@ async fn handle_token_refresh(
     let bearer_expires_at = now + state_store::BEARER_TOKEN_LIFETIME_SECS;
     let refresh_expires_at = now + state_store::REFRESH_TOKEN_LIFETIME_SECS;
 
-    // Find the old bearer session associated with this email (best-effort lookup).
-    // We pass None since we don't track the mapping from refresh→bearer in the new model.
-    let old_bearer_token = None;
+    // Use the bearer token stored in the refresh entry to invalidate the old session.
+    let old_bearer_token = refresh_entry.bearer_token.clone();
 
     // H-6: Atomic transaction — rotate bearer + refresh tokens.
     let input = state_store::RefreshTransactionInput {
@@ -1985,6 +2032,7 @@ mod tests {
             email: "user@corp.com".to_string(),
             refresh_expires_at: chrono::Utc::now().timestamp()
                 + state_store::REFRESH_TOKEN_LIFETIME_SECS,
+            bearer_token: Some(old_bearer.to_string()),
         };
         store
             .set_refresh_entry(old_refresh, &refresh_entry)

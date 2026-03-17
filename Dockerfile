@@ -16,10 +16,13 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
+RUN addgroup --system --gid 1001 appuser && adduser --system --uid 1001 --gid 1001 appuser
+
 COPY --from=builder /app/target/release/gws /usr/local/bin/gws
 COPY config/ /app/config/
 
 WORKDIR /app
+USER appuser
 
 # Cloud Run sets PORT env var (default 8080)
 ENV PORT=8080

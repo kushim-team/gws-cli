@@ -300,6 +300,7 @@ impl StateStore for InMemoryStateStore {
         );
 
         // Write bearer_session.
+        let bearer_token_for_refresh = input.bearer_token.clone();
         guard.bearer_sessions.insert(
             input.bearer_token,
             BearerSession {
@@ -314,6 +315,7 @@ impl StateStore for InMemoryStateStore {
             RefreshTokenEntry {
                 email: input.email,
                 refresh_expires_at: input.refresh_expires_at,
+                bearer_token: Some(bearer_token_for_refresh),
             },
         );
 
@@ -349,6 +351,7 @@ impl StateStore for InMemoryStateStore {
         }
 
         // Write new bearer_session.
+        let new_bearer_for_refresh = input.new_bearer_token.clone();
         guard.bearer_sessions.insert(
             input.new_bearer_token,
             BearerSession {
@@ -363,6 +366,7 @@ impl StateStore for InMemoryStateStore {
             RefreshTokenEntry {
                 email: input.email.clone(),
                 refresh_expires_at: input.refresh_expires_at,
+                bearer_token: Some(new_bearer_for_refresh),
             },
         );
 
@@ -431,6 +435,7 @@ mod tests {
         let entry = RefreshTokenEntry {
             email: "user@example.com".to_string(),
             refresh_expires_at: chrono::Utc::now().timestamp() - 10,
+            bearer_token: None,
         };
         store.set_refresh_entry("rt", &entry).await.unwrap();
         let loaded = store.get_refresh_entry("rt").await.unwrap();
@@ -560,6 +565,7 @@ mod tests {
         let refresh = RefreshTokenEntry {
             email: "user@example.com".to_string(),
             refresh_expires_at: now + 604800,
+            bearer_token: None,
         };
         store
             .set_refresh_entry("old_refresh", &refresh)
@@ -610,6 +616,7 @@ mod tests {
         let refresh = RefreshTokenEntry {
             email: "user@example.com".to_string(),
             refresh_expires_at: now + 604800,
+            bearer_token: None,
         };
         store.set_refresh_entry("refresh1", &refresh).await.unwrap();
 
@@ -672,6 +679,7 @@ mod tests {
         let entry = RefreshTokenEntry {
             email: "user@example.com".to_string(),
             refresh_expires_at: chrono::Utc::now().timestamp() + 604800,
+            bearer_token: None,
         };
         store.set_refresh_entry("rt1", &entry).await.unwrap();
         let loaded = store.get_refresh_entry("rt1").await.unwrap();

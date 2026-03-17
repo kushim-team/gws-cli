@@ -1032,6 +1032,19 @@ async fn handle_tools_call(
             ))
         })?;
 
+        // Check permissions (scopes + optional allow patterns) before executing.
+        if let Some(perms) = perm_ctx.permissions {
+            if let Some(email) = perm_ctx.user_email {
+                let method_id = format!("{}.{}.{}", svc_alias, resource_path, method_name);
+                if !perms.is_method_allowed_with_scopes(email, &method_id, &method.scopes) {
+                    return Err(GwsError::Validation(format!(
+                        "Permission denied: '{}' is not allowed for user '{}'",
+                        method_id, email
+                    )));
+                }
+            }
+        }
+
         return execute_mcp_method(&doc, method, arguments, access_token, perm_ctx, tool_name)
             .await;
     }
@@ -1089,8 +1102,8 @@ async fn handle_tools_call(
             let method_id = tool_name_to_method_id(tool_name);
             if !perms.is_method_allowed_with_scopes(email, &method_id, &method.scopes) {
                 return Err(GwsError::Validation(format!(
-                    "Permission denied: '{}' is not allowed for user '{}'",
-                    method_id, email
+                    "Permission denied: '{}' is not allowed for the current user",
+                    method_id
                 )));
             }
         }
