@@ -85,6 +85,12 @@ pub struct PendingCode {
     pub code_challenge: String,
     pub code_challenge_method: String,
     pub created_at: i64,
+    /// The redirect_uri from the authorization request (OAuth 2.1 §4.1.3).
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+    /// The client_id from the authorization request (OAuth 2.1).
+    #[serde(default)]
+    pub client_id: Option<String>,
 }
 
 /// A dynamically registered OAuth client.

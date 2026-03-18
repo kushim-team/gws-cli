@@ -451,6 +451,8 @@ mod tests {
             code_challenge: "cc".to_string(),
             code_challenge_method: "S256".to_string(),
             created_at: chrono::Utc::now().timestamp(),
+            redirect_uri: None,
+            client_id: None,
         };
         store.set_pending_code("code1", &pending).await.unwrap();
         let taken = store.take_pending_code("code1").await.unwrap();
@@ -489,6 +491,8 @@ mod tests {
             code_challenge: "cc".to_string(),
             code_challenge_method: "S256".to_string(),
             created_at: chrono::Utc::now().timestamp(),
+            redirect_uri: None,
+            client_id: None,
         };
         store.set_pending_code("code1", &pending).await.unwrap();
 
@@ -527,6 +531,8 @@ mod tests {
             code_challenge: "cc".to_string(),
             code_challenge_method: "S256".to_string(),
             created_at: chrono::Utc::now().timestamp(),
+            redirect_uri: None,
+            client_id: None,
         };
         store.set_pending_code("code1", &pending).await.unwrap();
 

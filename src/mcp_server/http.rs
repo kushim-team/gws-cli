@@ -671,6 +671,8 @@ async fn handle_oauth_callback(
         code_challenge: pending.code_challenge,
         code_challenge_method: pending.code_challenge_method,
         created_at: chrono::Utc::now().timestamp(),
+        redirect_uri: Some(pending.client_redirect_uri.clone()),
+        client_id: Some(pending.client_id),
     };
     if let Err(e) = store.set_pending_code(&our_code, &pending_code).await {
         match e {
@@ -806,6 +808,42 @@ async fn handle_token_authorization_code(
         Some(&pending_code.code_challenge_method),
     ) {
         return token_error_response("invalid_grant", "PKCE validation failed", cors_headers);
+    }
+
+    // OAuth 2.1 §4.1.3: If redirect_uri was included in the authorization request,
+    // the token request MUST include the same redirect_uri value.
+    if let Some(ref expected_redirect_uri) = pending_code.redirect_uri {
+        match params.get("redirect_uri") {
+            Some(uri) if uri != expected_redirect_uri => {
+                return token_error_response(
+                    "invalid_grant",
+                    "redirect_uri mismatch",
+                    cors_headers,
+                );
+            }
+            None => {
+                return token_error_response(
+                    "invalid_request",
+                    "Missing redirect_uri",
+                    cors_headers,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // OAuth 2.1: Public clients MUST send client_id in token request;
+    // it must match the client_id from the authorization request.
+    if let Some(ref expected_client_id) = pending_code.client_id {
+        match params.get("client_id") {
+            Some(cid) if cid != expected_client_id => {
+                return token_error_response("invalid_grant", "client_id mismatch", cors_headers);
+            }
+            None => {
+                return token_error_response("invalid_request", "Missing client_id", cors_headers);
+            }
+            _ => {}
+        }
     }
 
     // Issue bearer token and refresh token with 256-bit entropy each.
@@ -1167,12 +1205,7 @@ fn build_cors_headers(req_headers: &HeaderMap, allowed_origins: &[String]) -> He
     if let Some(origin) = req_headers.get("origin").and_then(|v| v.to_str().ok()) {
         let allowed = if allowed_origins.is_empty() {
             let lower = origin.to_lowercase();
-            lower.starts_with("http://localhost")
-                || lower.starts_with("https://localhost")
-                || lower.starts_with("http://127.0.0.1")
-                || lower.starts_with("https://127.0.0.1")
-                || lower.starts_with("http://[::1]")
-                || lower.starts_with("https://[::1]")
+            is_localhost_origin(&lower)
         } else {
             allowed_origins.iter().any(|a| a == origin)
         };
@@ -1688,6 +1721,8 @@ mod tests {
             code_challenge: challenge,
             code_challenge_method: "S256".to_string(),
             created_at: chrono::Utc::now().timestamp(),
+            redirect_uri: Some("http://localhost:3000/callback".to_string()),
+            client_id: Some("test-client-id".to_string()),
         };
         store.set_pending_code(code, &pc).await.unwrap();
     }
@@ -1881,8 +1916,9 @@ mod tests {
         make_pending_code(&state.state_store, "test-code", challenge).await;
 
         let app = test_app(state.clone());
-        let body_str =
-            format!("grant_type=authorization_code&code=test-code&code_verifier={verifier}");
+        let body_str = format!(
+            "grant_type=authorization_code&code=test-code&code_verifier={verifier}&redirect_uri=http://localhost:3000/callback&client_id=test-client-id"
+        );
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1945,6 +1981,8 @@ mod tests {
             code_challenge: challenge,
             code_challenge_method: "S256".to_string(),
             created_at: chrono::Utc::now().timestamp() - 700, // expired (>600s)
+            redirect_uri: Some("http://localhost:3000/callback".to_string()),
+            client_id: Some("test-client-id".to_string()),
         };
         state
             .state_store
@@ -1960,7 +1998,7 @@ mod tests {
                     .uri("/token")
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(Body::from(format!(
-                        "grant_type=authorization_code&code=expired-code&code_verifier={verifier}"
+                        "grant_type=authorization_code&code=expired-code&code_verifier={verifier}&redirect_uri=http://localhost:3000/callback&client_id=test-client-id"
                     )))
                     .unwrap(),
             )
