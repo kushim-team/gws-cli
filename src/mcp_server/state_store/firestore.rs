@@ -436,7 +436,8 @@ impl StateStore for FirestoreStateStore {
         &self,
         email: &str,
     ) -> Result<Option<UserSessionData>, StateStoreError> {
-        self.get_doc("user_sessions", email).await
+        let hashed = hash_token(email);
+        self.get_doc("user_sessions", &hashed).await
     }
 
     async fn set_user_session(
@@ -444,11 +445,13 @@ impl StateStore for FirestoreStateStore {
         email: &str,
         session: &UserSessionData,
     ) -> Result<(), StateStoreError> {
-        self.set_doc("user_sessions", email, session, None).await
+        let hashed = hash_token(email);
+        self.set_doc("user_sessions", &hashed, session, None).await
     }
 
     async fn delete_user_session(&self, email: &str) -> Result<(), StateStoreError> {
-        self.delete_doc("user_sessions", email).await
+        let hashed = hash_token(email);
+        self.delete_doc("user_sessions", &hashed).await
     }
 
     // ---- bearer_sessions ----
@@ -486,6 +489,12 @@ impl StateStore for FirestoreStateStore {
     async fn delete_bearer_session(&self, bearer_token: &str) -> Result<(), StateStoreError> {
         let hashed = hash_token(bearer_token);
         self.delete_doc("bearer_sessions", &hashed).await
+    }
+
+    async fn delete_bearer_session_by_stored_key(&self, key: &str) -> Result<(), StateStoreError> {
+        // Firestore stores hashed bearer tokens as document IDs,
+        // and RefreshTokenEntry.bearer_token already contains the hash.
+        self.delete_doc("bearer_sessions", key).await
     }
 
     // ---- refresh_tokens ----
@@ -527,10 +536,11 @@ impl StateStore for FirestoreStateStore {
     // ---- pending_codes ----
 
     async fn take_pending_code(&self, code: &str) -> Result<Option<PendingCode>, StateStoreError> {
-        let pending: Option<PendingCode> = self.get_doc("pending_codes", code).await?;
+        let hashed = hash_token(code);
+        let pending: Option<PendingCode> = self.get_doc("pending_codes", &hashed).await?;
         if pending.is_some() {
             // Use preconditioned delete via commit to prevent concurrent take.
-            let writes = vec![self.build_preconditioned_delete_write("pending_codes", code)];
+            let writes = vec![self.build_preconditioned_delete_write("pending_codes", &hashed)];
             self.commit_transaction(writes).await?;
         }
         if let Some(ref p) = pending {
@@ -546,18 +556,20 @@ impl StateStore for FirestoreStateStore {
         code: &str,
         pending: &PendingCode,
     ) -> Result<(), StateStoreError> {
+        let hashed = hash_token(code);
         let expires_at = pending.created_at + AUTH_CODE_TTL_SECS;
-        self.set_doc("pending_codes", code, pending, Some(expires_at))
+        self.set_doc("pending_codes", &hashed, pending, Some(expires_at))
             .await
     }
 
     // ---- pending_auths ----
 
     async fn take_pending_auth(&self, state: &str) -> Result<Option<PendingAuth>, StateStoreError> {
-        let auth: Option<PendingAuth> = self.get_doc("pending_auths", state).await?;
+        let hashed = hash_token(state);
+        let auth: Option<PendingAuth> = self.get_doc("pending_auths", &hashed).await?;
         if auth.is_some() {
             // Use preconditioned delete via commit to prevent concurrent take.
-            let writes = vec![self.build_preconditioned_delete_write("pending_auths", state)];
+            let writes = vec![self.build_preconditioned_delete_write("pending_auths", &hashed)];
             self.commit_transaction(writes).await?;
         }
         if let Some(ref a) = auth {
@@ -573,8 +585,9 @@ impl StateStore for FirestoreStateStore {
         state: &str,
         auth: &PendingAuth,
     ) -> Result<(), StateStoreError> {
+        let hashed = hash_token(state);
         let expires_at = auth.created_at + PENDING_AUTH_TTL_SECS;
-        self.set_doc("pending_auths", state, auth, Some(expires_at))
+        self.set_doc("pending_auths", &hashed, auth, Some(expires_at))
             .await
     }
 
@@ -617,13 +630,15 @@ impl StateStore for FirestoreStateStore {
         let mut writes = Vec::new();
 
         // Delete PendingCode (preconditioned: must exist to prevent replay).
-        writes.push(self.build_preconditioned_delete_write("pending_codes", &input.auth_code));
+        let hashed_code = hash_token(&input.auth_code);
+        writes.push(self.build_preconditioned_delete_write("pending_codes", &hashed_code));
 
         // Upsert user_session.
         let user_session = UserSessionData {
             google_tokens: input.google_tokens,
         };
-        writes.push(self.build_write("user_sessions", &input.email, &user_session, None)?);
+        let hashed_email = hash_token(&input.email);
+        writes.push(self.build_write("user_sessions", &hashed_email, &user_session, None)?);
 
         // Create bearer_session.
         let bearer = BearerSession {
@@ -638,11 +653,12 @@ impl StateStore for FirestoreStateStore {
             Some(input.bearer_expires_at),
         )?);
 
-        // Create refresh_token.
+        // Create refresh_token — store hashed bearer token to avoid
+        // exposing raw bearer on encryption key compromise.
         let refresh = RefreshTokenEntry {
             email: input.email,
             refresh_expires_at: input.refresh_expires_at,
-            bearer_token: Some(input.bearer_token.clone()),
+            bearer_token: Some(hashed_bearer.clone()),
         };
         let hashed_refresh = hash_token(&input.refresh_token);
         writes.push(self.build_write(
@@ -666,9 +682,9 @@ impl StateStore for FirestoreStateStore {
         writes.push(self.build_preconditioned_delete_write("refresh_tokens", &hashed_old_refresh));
 
         // Delete old bearer session if known.
-        if let Some(ref old_bearer) = input.old_bearer_token {
-            let hashed_old_bearer = hash_token(old_bearer);
-            writes.push(self.build_delete_write("bearer_sessions", &hashed_old_bearer));
+        // old_bearer_token is already a hashed key (stored by this impl).
+        if let Some(ref old_bearer_key) = input.old_bearer_token {
+            writes.push(self.build_delete_write("bearer_sessions", old_bearer_key));
         }
 
         // Create new bearer_session.
@@ -684,11 +700,11 @@ impl StateStore for FirestoreStateStore {
             Some(input.bearer_expires_at),
         )?);
 
-        // Create new refresh_token.
+        // Create new refresh_token — store hashed bearer token.
         let refresh = RefreshTokenEntry {
             email: input.email.clone(),
             refresh_expires_at: input.refresh_expires_at,
-            bearer_token: Some(input.new_bearer_token.clone()),
+            bearer_token: Some(hashed_new_bearer.clone()),
         };
         let hashed_new_refresh = hash_token(&input.new_refresh_token);
         writes.push(self.build_write(
@@ -703,7 +719,8 @@ impl StateStore for FirestoreStateStore {
             let session = UserSessionData {
                 google_tokens: tokens,
             };
-            writes.push(self.build_write("user_sessions", &input.email, &session, None)?);
+            let hashed_email = hash_token(&input.email);
+            writes.push(self.build_write("user_sessions", &hashed_email, &session, None)?);
         }
 
         self.commit_transaction(writes).await

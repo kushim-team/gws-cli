@@ -131,6 +131,11 @@ impl StateStore for InMemoryStateStore {
         Ok(())
     }
 
+    async fn delete_bearer_session_by_stored_key(&self, key: &str) -> Result<(), StateStoreError> {
+        // InMemory stores raw bearer tokens as keys.
+        self.delete_bearer_session(key).await
+    }
+
     // ---- refresh_tokens ----
 
     async fn get_refresh_entry(

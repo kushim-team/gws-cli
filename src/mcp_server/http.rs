@@ -55,8 +55,11 @@ pub(super) async fn serve(
         )
         .route("/authorize", get(handle_authorize))
         .route("/oauth/callback", get(handle_oauth_callback))
-        .route("/token", post(handle_token))
-        .route("/register", post(handle_register))
+        .route("/token", post(handle_token).options(handle_cors_preflight))
+        .route(
+            "/register",
+            post(handle_register).options(handle_cors_preflight),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(1_048_576))
         .layer(axum::middleware::from_fn(security_headers_middleware))
         .with_state(state);
@@ -994,7 +997,7 @@ async fn handle_token_refresh(
                     let _ = store.delete_user_session(email).await;
                     let _ = store.delete_refresh_entry(&old_refresh).await;
                     if let Some(ref bt) = refresh_entry.bearer_token {
-                        let _ = store.delete_bearer_session(bt).await;
+                        let _ = store.delete_bearer_session_by_stored_key(bt).await;
                     }
                     return token_error_response(
                         "invalid_grant",
@@ -1199,6 +1202,12 @@ async fn handle_register(
         .into_response()
 }
 
+/// Handle CORS preflight (OPTIONS) requests for OAuth endpoints.
+async fn handle_cors_preflight(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let cors_headers = build_cors_headers(&headers, &state.allowed_origins);
+    (StatusCode::NO_CONTENT, cors_headers).into_response()
+}
+
 /// Build CORS response headers for OAuth endpoints.
 fn build_cors_headers(req_headers: &HeaderMap, allowed_origins: &[String]) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -1308,8 +1317,11 @@ mod tests {
             )
             .route("/authorize", get(handle_authorize))
             .route("/oauth/callback", get(handle_oauth_callback))
-            .route("/token", post(handle_token))
-            .route("/register", post(handle_register))
+            .route("/token", post(handle_token).options(handle_cors_preflight))
+            .route(
+                "/register",
+                post(handle_register).options(handle_cors_preflight),
+            )
             .with_state(state)
     }
 

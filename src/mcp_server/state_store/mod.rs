@@ -174,6 +174,12 @@ pub trait StateStore: Send + Sync {
     ) -> Result<(), StateStoreError>;
     async fn delete_bearer_session(&self, bearer_token: &str) -> Result<(), StateStoreError>;
 
+    /// Delete a bearer session using the stored key from `RefreshTokenEntry.bearer_token`.
+    ///
+    /// For InMemory, the stored key is the raw bearer token.
+    /// For Firestore, the stored key is the SHA-256 hash (already the document ID).
+    async fn delete_bearer_session_by_stored_key(&self, key: &str) -> Result<(), StateStoreError>;
+
     // ---- refresh_tokens ----
 
     async fn get_refresh_entry(
