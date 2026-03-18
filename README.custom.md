@@ -55,9 +55,10 @@ gws mcp -s all                    # expose all services (many tools!)
 | `-p, --port <port>`            | HTTP port (env: `PORT`, default: 8080)                 |
 | `--host <host>`                | Host address to bind (default: 127.0.0.1)              |
 | `--permissions-file <path>`    | Path to permissions YAML (env: `GWS_PERMISSIONS_FILE`) |
-| `--token-store-backend <mode>` | `memory` (default) or `secret-manager` (env: `GWS_TOKEN_STORE_BACKEND`) |
-| `--secret-manager-project <id>`| GCP project ID (env: `GWS_SECRET_MANAGER_PROJECT`)     |
-| `--secret-manager-secret <id>` | Secret ID (env: `GWS_SECRET_MANAGER_SECRET`, default: `gws-mcp-sessions`) |
+| `--token-store-backend <mode>` | `memory` (default) or `firestore` (env: `GWS_TOKEN_STORE_BACKEND`) |
+| `--firestore-project <id>`     | GCP project ID for Firestore (env: `GWS_FIRESTORE_PROJECT`)        |
+| `--firestore-database <id>`    | Firestore database ID (env: `GWS_FIRESTORE_DATABASE`, default: `mcp-gateway`) |
+| `--encryption-key-secret <id>` | Secret Manager secret for encryption key (env: `GWS_ENCRYPTION_KEY_SECRET`, default: `mcp-gateway-encryption-key`) |
 
 ### Permission Control (HTTP Gateway)
 
@@ -203,7 +204,7 @@ The gateway supports two backends for persisting OAuth sessions (bearer tokens +
 | Backend | Use case | Sessions survive restart? |
 |---------|----------|--------------------------|
 | `memory` (default) | Local development | No |
-| `secret-manager` | Cloud Run production | Yes |
+| `firestore` | Cloud Run production | Yes |
 
 **Local development (in-memory):**
 
@@ -214,21 +215,22 @@ gws mcp -s drive \
 # Sessions are lost when the process exits
 ```
 
-**Cloud Run (Secret Manager):**
+**Cloud Run (Firestore):**
 
 ```bash
 gws mcp -s all \
-  --token-store-backend secret-manager \
-  --secret-manager-project my-gcp-project \
-  --secret-manager-secret gws-mcp-sessions \
+  --token-store-backend firestore \
+  --firestore-project my-gcp-project \
+  --firestore-database mcp-gateway \
+  --encryption-key-secret mcp-gateway-encryption-key \
   --oauth-client-id $CLIENT_ID \
   --gateway-base-url https://gw.example.com
 ```
 
-The Secret Manager backend stores all sessions as a single JSON secret. On startup, persisted sessions are loaded into memory. On each session mutation (create, refresh, expire), the secret is updated.
+The Firestore backend stores all session state (bearer tokens, refresh tokens, Google OAuth tokens, pending auth flows) in a dedicated Firestore database. Each document is encrypted at the application layer with AES-256-GCM before being written. The encryption key is loaded from Secret Manager at startup. Since all state lives in Firestore, the server is fully stateless and can scale to multiple instances.
 
 > [!NOTE]
-> The Cloud Run service account needs the `Secret Manager Admin` role (`roles/secretmanager.admin`) on the project, or `Secret Manager Secret Version Manager` on the specific secret. The secret is auto-created on first use if it doesn't exist.
+> The Cloud Run service account needs `roles/datastore.user` on the project and `roles/secretmanager.secretAccessor` on the specific secrets. See [specs/remote-mcp-gateway/operations.md](specs/remote-mcp-gateway/operations.md) for detailed setup instructions.
 
 ## MCP Authorization Specification Compliance
 

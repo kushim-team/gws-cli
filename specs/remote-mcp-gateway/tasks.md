@@ -67,7 +67,7 @@
 - [x] `http.rs` を `Mutex<TokenStore>` → `Arc<dyn StateStore>` に移行
 - [x] `mcp_server.rs` CLI 引数更新 (`--token-store-backend firestore`)
 - [x] `session_store.rs` 削除 (`state_store.rs` に統合)
-- [ ] Firestore TTL ポリシー設定手順をドキュメント化
+- [x] Firestore TTL ポリシー設定手順をドキュメント化 (`operations.md` Section 1)
 
 **H-2: データモデル変更 (`user_sessions` 分離)**
 - [x] `user_sessions` コレクション追加 (doc ID = email, Google tokens を格納)
@@ -112,6 +112,6 @@
 - [x] Secret Manager から暗号化鍵をロードする処理実装
 - [x] `FirestoreStateStore` の読み書きに暗号化・復号を組み込み
 - [x] 専用 Firestore データベース作成 (デフォルト DB とは分離)
-- [ ] Data Access 監査ログの有効化手順をドキュメント化
-- [ ] Cloud Run サービスアカウントに最小権限 IAM 設定
+- [x] Data Access 監査ログの有効化手順をドキュメント化 (`operations.md` Section 2)
+- [x] Cloud Run サービスアカウントに最小権限 IAM 設定 (`operations.md` Section 3)
 - [x] 構造化ログにトークン値を含めない (プレフィックス/ハッシュのみ記録)

@@ -90,15 +90,14 @@ jobs:
           service: ${{ env.CLOUD_RUN_SERVICE }}
           region: ${{ env.GCP_REGION }}
           image: ${{ env.IMAGE_TAG }}
-          # max-instances=1: Session store loads from Secret Manager only at
-          # startup and stays in memory. Multiple instances would serve stale
-          # sessions. See session_store.rs module doc for details.
+          # Firestore backend is fully stateless — all state lives in Firestore.
+          # Multiple instances can safely serve concurrent requests.
           flags: |
             --port=8080
             --memory=512Mi
             --cpu=1
             --min-instances=0
-            --max-instances=1
+            --max-instances=3
             --concurrency=80
             --timeout=300s
             --allow-unauthenticated
@@ -106,9 +105,10 @@ jobs:
           env_vars: |
             RUST_LOG=info
             GWS_GATEWAY_BASE_URL=${{ steps.service-url.outputs.url }}
-            GWS_TOKEN_STORE_BACKEND=secret-manager
-            GWS_SECRET_MANAGER_PROJECT=${{ vars.GCP_PROJECT_ID }}
-            GWS_SECRET_MANAGER_SECRET=${{ vars.GWS_SESSION_SECRET_ID || 'gws-mcp-sessions' }}
+            GWS_TOKEN_STORE_BACKEND=firestore
+            GWS_FIRESTORE_PROJECT=${{ vars.GCP_PROJECT_ID }}
+            GWS_FIRESTORE_DATABASE=${{ vars.GWS_FIRESTORE_DATABASE || 'mcp-gateway' }}
+            GWS_ENCRYPTION_KEY_SECRET=${{ vars.GWS_ENCRYPTION_KEY_SECRET || 'mcp-gateway-encryption-key' }}
           secrets: |
             GOOGLE_WORKSPACE_CLI_CLIENT_ID=gws-oauth-client-id:latest
             GOOGLE_WORKSPACE_CLI_CLIENT_SECRET=gws-oauth-client-secret:latest
