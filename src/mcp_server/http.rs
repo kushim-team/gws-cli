@@ -786,14 +786,16 @@ async fn handle_token_authorization_code(
                 cors_headers,
             );
         }
-        Err(StateStoreError::Unavailable(_)) => {
+        Err(StateStoreError::Unavailable(msg)) => {
+            tracing::warn!(error = %msg, "take_pending_code unavailable");
             return token_error_response(
                 "server_error",
                 "Service temporarily unavailable",
                 cors_headers,
             );
         }
-        Err(_) => {
+        Err(e) => {
+            tracing::error!(error = %e, "take_pending_code failed");
             return token_error_response("server_error", "Internal error", cors_headers);
         }
     };
@@ -868,14 +870,16 @@ async fn handle_token_authorization_code(
     };
     if let Err(e) = store.exchange_code_transaction(input).await {
         match e {
-            StateStoreError::CapacityExceeded(_) => {
+            StateStoreError::CapacityExceeded(ref msg) => {
+                tracing::warn!(error = %msg, "exchange_code_transaction capacity exceeded");
                 return token_error_response(
                     "server_error",
                     "Too many active sessions",
                     cors_headers,
                 );
             }
-            StateStoreError::Unavailable(_) => {
+            StateStoreError::Unavailable(ref msg) => {
+                tracing::warn!(error = %msg, "exchange_code_transaction unavailable");
                 return token_error_response(
                     "server_error",
                     "Service temporarily unavailable",
@@ -946,14 +950,16 @@ async fn handle_token_refresh(
         Ok(None) => {
             return token_error_response("invalid_grant", "Unknown refresh token", cors_headers);
         }
-        Err(StateStoreError::Unavailable(_)) => {
+        Err(StateStoreError::Unavailable(msg)) => {
+            tracing::warn!(error = %msg, "get_refresh_entry unavailable");
             return token_error_response(
                 "server_error",
                 "Service temporarily unavailable",
                 cors_headers,
             );
         }
-        Err(_) => {
+        Err(e) => {
+            tracing::error!(error = %e, "get_refresh_entry failed");
             return token_error_response("server_error", "Internal error", cors_headers);
         }
     };
@@ -968,7 +974,8 @@ async fn handle_token_refresh(
             let _ = store.delete_refresh_entry(&old_refresh).await;
             return token_error_response("invalid_grant", "Session expired", cors_headers);
         }
-        Err(_) => {
+        Err(e) => {
+            tracing::error!(error = %e, "get_user_session failed");
             return token_error_response("server_error", "Internal error", cors_headers);
         }
     };
@@ -1039,14 +1046,16 @@ async fn handle_token_refresh(
     };
     if let Err(e) = store.refresh_token_transaction(input).await {
         match e {
-            StateStoreError::CapacityExceeded(_) => {
+            StateStoreError::CapacityExceeded(ref msg) => {
+                tracing::warn!(error = %msg, "refresh_token_transaction capacity exceeded");
                 return token_error_response(
                     "server_error",
                     "Too many active sessions",
                     cors_headers,
                 );
             }
-            StateStoreError::Unavailable(_) => {
+            StateStoreError::Unavailable(ref msg) => {
+                tracing::warn!(error = %msg, "refresh_token_transaction unavailable");
                 return token_error_response(
                     "server_error",
                     "Service temporarily unavailable",
