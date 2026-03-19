@@ -629,9 +629,8 @@ impl StateStore for FirestoreStateStore {
 
         let mut writes = Vec::new();
 
-        // Delete PendingCode (preconditioned: must exist to prevent replay).
-        let hashed_code = hash_token(&input.auth_code);
-        writes.push(self.build_preconditioned_delete_write("pending_codes", &hashed_code));
+        // PendingCode was already consumed by take_pending_code() in the handler,
+        // so we do not delete it again here.
 
         // Upsert user_session.
         let user_session = UserSessionData {
