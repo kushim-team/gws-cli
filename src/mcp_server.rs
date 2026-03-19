@@ -755,10 +755,17 @@ fn walk_resources(prefix: &str, resources: &HashMap<String, RestResource>, tools
             }
             if method.supports_media_upload {
                 properties.insert(
-                    "upload".to_string(),
+                    "upload_content".to_string(),
                     json!({
                         "type": "string",
-                        "description": "Local file path to upload as media content"
+                        "description": "Base64-encoded file content to upload as media."
+                    }),
+                );
+                properties.insert(
+                    "upload_content_type".to_string(),
+                    json!({
+                        "type": "string",
+                        "description": "MIME type of the upload_content (e.g. 'application/pdf', 'text/markdown'). Required when upload_content is provided."
                     }),
                 );
             }
@@ -1112,6 +1119,41 @@ async fn handle_tools_call(
     execute_mcp_method(&doc, method, arguments, access_token, perm_ctx, tool_name).await
 }
 
+/// Decode inline upload content from MCP tool arguments.
+///
+/// Extracts `"upload_content"` (base64-encoded) and `"upload_content_type"`
+/// from the JSON arguments for remote MCP servers where the server cannot
+/// access local client files.
+fn decode_upload_content(arguments: &Value) -> Result<Option<(Vec<u8>, String)>, GwsError> {
+    let b64 = match arguments
+        .get("upload_content")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let content_type = arguments
+        .get("upload_content_type")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            GwsError::Validation(
+                "upload_content_type is required when upload_content is provided".to_string(),
+            )
+        })?;
+    if content_type.contains('\r') || content_type.contains('\n') {
+        return Err(GwsError::Validation(
+            "upload_content_type must not contain CR or LF".to_string(),
+        ));
+    }
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let data = STANDARD.decode(b64).map_err(|e| {
+        GwsError::Validation(format!("Failed to decode upload_content as base64: {e}"))
+    })?;
+    Ok(Some((data, content_type.to_string())))
+}
+
 async fn execute_mcp_method(
     doc: &crate::discovery::RestDescription,
     method: &crate::discovery::RestMethod,
@@ -1136,25 +1178,10 @@ async fn execute_mcp_method(
         .transpose()
         .map_err(|e| GwsError::Validation(format!("Failed to serialize body: {e}")))?;
 
-    let upload_source = if let Some(raw) = arguments
-        .get("upload")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        let p = std::path::Path::new(raw);
-        if p.is_absolute() || p.components().any(|c| c == std::path::Component::ParentDir) {
-            return Err(GwsError::Validation(format!(
-                "Upload path '{}' is not allowed. Paths must be relative and within the current directory.",
-                raw
-            )));
-        }
-        Some(crate::executor::UploadSource::File {
-            path: raw,
-            content_type: None,
-        })
-    } else {
-        None
-    };
+    let inline_upload = decode_upload_content(arguments)?;
+    let upload_source = inline_upload
+        .as_ref()
+        .map(|(data, content_type)| crate::executor::UploadSource::Bytes { data, content_type });
 
     let page_all = arguments
         .get("page_all")
@@ -1667,5 +1694,83 @@ mod tests {
         assert_eq!(tools.len(), 5);
         assert_eq!(tools[0]["name"], "workflow_standup_report");
         assert_eq!(tools[4]["name"], "workflow_file_announce");
+    }
+}
+
+#[cfg(test)]
+mod upload_content_tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    #[test]
+    fn test_decode_upload_content_none_when_absent() {
+        let args = json!({});
+        assert!(decode_upload_content(&args).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_decode_upload_content_none_when_empty() {
+        let args = json!({"upload_content": ""});
+        assert!(decode_upload_content(&args).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_decode_upload_content_requires_content_type() {
+        let b64 = STANDARD.encode(b"hello");
+        let args = json!({"upload_content": b64});
+        let result = decode_upload_content(&args);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("upload_content_type is required"));
+    }
+
+    #[test]
+    fn test_decode_upload_content_valid() {
+        let data = b"# Hello World\nThis is markdown.";
+        let b64 = STANDARD.encode(data);
+        let args = json!({
+            "upload_content": b64,
+            "upload_content_type": "text/markdown"
+        });
+        let result = decode_upload_content(&args).unwrap().unwrap();
+        assert_eq!(result.0, data);
+        assert_eq!(result.1, "text/markdown");
+    }
+
+    #[test]
+    fn test_decode_upload_content_binary() {
+        let data: Vec<u8> = (0..=255).collect();
+        let b64 = STANDARD.encode(&data);
+        let args = json!({
+            "upload_content": b64,
+            "upload_content_type": "application/octet-stream"
+        });
+        let result = decode_upload_content(&args).unwrap().unwrap();
+        assert_eq!(result.0, data);
+    }
+
+    #[test]
+    fn test_decode_upload_content_invalid_base64() {
+        let args = json!({
+            "upload_content": "not-valid-base64!!!",
+            "upload_content_type": "text/plain"
+        });
+        let result = decode_upload_content(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("base64"));
+    }
+
+    #[test]
+    fn test_decode_upload_content_rejects_crlf_in_content_type() {
+        let b64 = STANDARD.encode(b"data");
+        let args = json!({
+            "upload_content": b64,
+            "upload_content_type": "text/plain\r\nX-Injected: header"
+        });
+        let result = decode_upload_content(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("CR or LF"));
     }
 }
