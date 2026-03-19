@@ -19,7 +19,7 @@ mod http;
 mod jsonrpc;
 pub(crate) mod oauth;
 pub(crate) mod permissions;
-pub(crate) mod session_store;
+pub(crate) mod state_store;
 
 use crate::discovery::RestResource;
 use crate::error::GwsError;
@@ -134,23 +134,30 @@ fn build_mcp_cli() -> Command {
         .arg(
             Arg::new("token-store-backend")
                 .long("token-store-backend")
-                .value_parser(["memory", "secret-manager"])
+                .value_parser(["memory", "firestore"])
                 .default_value("memory")
-                .help("Token store backend: 'memory' (local dev) or 'secret-manager' (Cloud Run)")
+                .help("Token store backend: 'memory' (local dev) or 'firestore' (Cloud Run)")
                 .env("GWS_TOKEN_STORE_BACKEND"),
         )
         .arg(
-            Arg::new("secret-manager-project")
-                .long("secret-manager-project")
-                .help("GCP project ID for Secret Manager (required when backend=secret-manager)")
-                .env("GWS_SECRET_MANAGER_PROJECT"),
+            Arg::new("firestore-project")
+                .long("firestore-project")
+                .help("GCP project ID for Firestore (required when backend=firestore)")
+                .env("GWS_FIRESTORE_PROJECT"),
         )
         .arg(
-            Arg::new("secret-manager-secret")
-                .long("secret-manager-secret")
-                .help("Secret ID in Secret Manager (env: GWS_SECRET_MANAGER_SECRET)")
-                .env("GWS_SECRET_MANAGER_SECRET")
-                .default_value("gws-mcp-sessions"),
+            Arg::new("firestore-database")
+                .long("firestore-database")
+                .help("Firestore database ID (env: GWS_FIRESTORE_DATABASE)")
+                .env("GWS_FIRESTORE_DATABASE")
+                .default_value("mcp-gateway"),
+        )
+        .arg(
+            Arg::new("encryption-key-secret")
+                .long("encryption-key-secret")
+                .help("Secret Manager secret name for encryption key (env: GWS_ENCRYPTION_KEY_SECRET)")
+                .env("GWS_ENCRYPTION_KEY_SECRET")
+                .default_value("mcp-gateway-encryption-key"),
         )
 }
 
@@ -321,15 +328,13 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
     init_usage_tracing();
 
     if config.services.is_empty() {
-        eprintln!("[gws mcp] Warning: No services configured. Zero tools will be exposed.");
-        eprintln!("[gws mcp] Re-run with: gws mcp -s <service> (e.g., -s drive,gmail,calendar)");
-        eprintln!("[gws mcp] Use -s all to expose all available services.");
+        tracing::warn!("no services configured, zero tools will be exposed");
     } else {
-        eprintln!(
-            "[gws mcp] Starting with services: {}",
-            config.services.join(", ")
+        tracing::info!(
+            services = config.services.join(", "),
+            tool_mode = ?config.tool_mode,
+            "server starting"
         );
-        eprintln!("[gws mcp] Tool mode: {:?}", config.tool_mode);
     }
 
     // Parse required OAuth config.
@@ -339,7 +344,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
     let base_url = base_url.trim_end_matches('/').to_string();
     oauth::validate_gateway_base_url(&base_url).map_err(GwsError::Validation)?;
     let scopes = matches.get_one::<String>("oauth-scopes").unwrap().clone();
-    eprintln!("[gws mcp] OAuth enabled for gateway auth");
+    tracing::info!("oauth enabled for gateway auth");
     let oauth_config = oauth::OAuthConfig {
         client_id: client_id.clone(),
         client_secret: client_secret.clone(),
@@ -352,7 +357,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         Some(path) => {
             let pc =
                 permissions::PermissionsConfig::load_from_file(path).map_err(GwsError::Other)?;
-            eprintln!("[gws mcp] Permissions loaded from {path}");
+            tracing::info!(path = path, "permissions loaded");
             Some(pc)
         }
         None => None,
@@ -379,49 +384,68 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
                 }
             }
             oauth_config.scopes = scopes.join(" ");
-            eprintln!(
-                "[gws mcp] OAuth scopes narrowed to permissions union: {}",
-                oauth_config.scopes
+            tracing::info!(
+                scopes = oauth_config.scopes,
+                "oauth scopes narrowed to permissions union"
             );
         }
     }
 
-    // Build session persistence backend.
+    // Build state store backend.
     let backend = matches
         .get_one::<String>("token-store-backend")
         .unwrap()
         .as_str();
-    let persistence: Arc<dyn session_store::SessionPersistence> = match backend {
-        "secret-manager" => {
+    let store: Arc<dyn state_store::StateStore> = match backend {
+        "firestore" => {
             let project = matches
-                .get_one::<String>("secret-manager-project")
+                .get_one::<String>("firestore-project")
                 .ok_or_else(|| {
                     GwsError::Validation(
-                        "--secret-manager-project is required when token-store-backend=secret-manager".to_string(),
+                        "--firestore-project is required when token-store-backend=firestore"
+                            .to_string(),
                     )
                 })?
                 .clone();
-            let secret_id = matches
-                .get_one::<String>("secret-manager-secret")
+            let database = matches
+                .get_one::<String>("firestore-database")
                 .unwrap()
                 .clone();
-            eprintln!(
-                "[gws mcp] Token store: Secret Manager (project={project}, secret={secret_id})"
+            let encryption_key_secret = matches
+                .get_one::<String>("encryption-key-secret")
+                .unwrap()
+                .clone();
+            tracing::info!(
+                backend = "firestore",
+                project = project,
+                database = database,
+                "state store configured"
             );
-            Arc::new(session_store::SecretManagerPersistence::new(
-                project, secret_id,
-            ))
+            Arc::new(
+                state_store::FirestoreStateStore::from_secret_manager(
+                    project,
+                    database,
+                    encryption_key_secret,
+                )
+                .await
+                .map_err(|e| {
+                    GwsError::Other(anyhow::anyhow!("Failed to init Firestore store: {e}"))
+                })?,
+            )
         }
         _ => {
-            eprintln!("[gws mcp] Token store: in-memory (sessions lost on restart)");
-            Arc::new(session_store::InMemoryPersistence)
+            tracing::info!(
+                backend = "in-memory",
+                "state store configured (sessions lost on restart)"
+            );
+            Arc::new(state_store::InMemoryStateStore::new())
         }
     };
 
     let port = *matches.get_one::<u16>("port").unwrap();
     let host = matches.get_one::<String>("host").unwrap().clone();
     let allow_origin = matches.get_one::<String>("allow-origin").unwrap().clone();
-    eprintln!("[gws mcp] Starting HTTP transport on {host}:{port}");
+    tracing::info!(host = host, port = port, "starting HTTP transport");
     http::serve(
         config,
         &host,
@@ -429,7 +453,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
         &allow_origin,
         oauth_config,
         permissions_config,
-        persistence,
+        store,
     )
     .await
 }
@@ -526,7 +550,10 @@ async fn build_tools_list(config: &ServerConfig) -> Result<Vec<Value>, GwsError>
         if let Ok(doc) = crate::discovery::fetch_discovery_document(&api_name, &version).await {
             walk_resources(&doc.name, &doc.resources, &mut tools);
         } else {
-            eprintln!("[gws mcp] Warning: Failed to load discovery document for service '{}'. It will not be available as a tool.", svc_name);
+            tracing::warn!(
+                service = svc_name.as_str(),
+                "failed to load discovery document, service will not be available as a tool"
+            );
         }
     }
 
@@ -563,9 +590,9 @@ async fn build_compact_tools_list(config: &ServerConfig) -> Result<Vec<Value>, G
                 format!("{}. Resources: {}", desc, names_str.join(", "))
             }
         } else {
-            eprintln!(
-                "[gws mcp] Warning: Failed to load discovery document for '{}'. Tool will have minimal description.",
-                svc_name
+            tracing::warn!(
+                service = svc_name.as_str(),
+                "failed to load discovery document, tool will have minimal description"
             );
             format!("Google Workspace API: {}", svc_name)
         };
@@ -1005,6 +1032,19 @@ async fn handle_tools_call(
             ))
         })?;
 
+        // Check permissions (scopes + optional allow patterns) before executing.
+        if let Some(perms) = perm_ctx.permissions {
+            if let Some(email) = perm_ctx.user_email {
+                let method_id = format!("{}.{}.{}", svc_alias, resource_path, method_name);
+                if !perms.is_method_allowed_with_scopes(email, &method_id, &method.scopes) {
+                    return Err(GwsError::Validation(format!(
+                        "Permission denied: '{}' is not allowed for the current user",
+                        method_id
+                    )));
+                }
+            }
+        }
+
         return execute_mcp_method(&doc, method, arguments, access_token, perm_ctx, tool_name)
             .await;
     }
@@ -1062,8 +1102,8 @@ async fn handle_tools_call(
             let method_id = tool_name_to_method_id(tool_name);
             if !perms.is_method_allowed_with_scopes(email, &method_id, &method.scopes) {
                 return Err(GwsError::Validation(format!(
-                    "Permission denied: '{}' is not allowed for user '{}'",
-                    method_id, email
+                    "Permission denied: '{}' is not allowed for the current user",
+                    method_id
                 )));
             }
         }
