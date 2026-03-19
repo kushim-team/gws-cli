@@ -31,13 +31,16 @@ mod formatter;
 mod fs_util;
 mod generate_skills;
 mod helpers;
+mod logging;
 mod mcp_server;
 mod oauth_config;
+mod output;
 mod schema;
 mod services;
 mod setup;
 mod setup_tui;
 mod text;
+mod timezone;
 mod token_storage;
 pub(crate) mod validate;
 
@@ -48,9 +51,12 @@ async fn main() {
     // Load .env file if present (silently ignored if missing)
     let _ = dotenvy::dotenv();
 
+    // Initialize structured logging (no-op if env vars are unset)
+    logging::init_logging();
+
     if let Err(err) = run().await {
         print_error_json(&err);
-        std::process::exit(1);
+        std::process::exit(err.exit_code());
     }
 }
 
@@ -216,12 +222,40 @@ async fn run() -> Result<(), GwsError> {
         .ok()
         .flatten()
         .map(|s| s.as_str());
-    let output_path = matched_args.get_one::<String>("output").map(|s| s.as_str());
     let upload_path = matched_args
         .try_get_one::<String>("upload")
         .ok()
         .flatten()
         .map(|s| s.as_str());
+    let output_path = matched_args.get_one::<String>("output").map(|s| s.as_str());
+
+    // Validate file paths against traversal before any I/O.
+    // Use the returned canonical paths so the validated path is the one
+    // actually used for I/O (closes TOCTOU gap).
+    let upload_path_buf = if let Some(p) = upload_path {
+        Some(crate::validate::validate_safe_file_path(p, "--upload")?)
+    } else {
+        None
+    };
+    let output_path_buf = if let Some(p) = output_path {
+        Some(crate::validate::validate_safe_file_path(p, "--output")?)
+    } else {
+        None
+    };
+    let upload_path = upload_path_buf.as_deref().and_then(|p| p.to_str());
+    let output_path = output_path_buf.as_deref().and_then(|p| p.to_str());
+
+    let upload = {
+        let upload_content_type = matched_args
+            .try_get_one::<String>("upload-content-type")
+            .ok()
+            .flatten()
+            .map(|s| s.as_str());
+        upload_path.map(|path| executor::UploadSource::File {
+            path,
+            content_type: upload_content_type,
+        })
+    };
 
     let dry_run = matched_args.get_flag("dry-run");
 
@@ -259,7 +293,7 @@ async fn run() -> Result<(), GwsError> {
         token.as_deref(),
         auth_method,
         output_path,
-        upload_path,
+        upload,
         dry_run,
         &pagination,
         sanitize_config.template.as_deref(),
@@ -427,6 +461,7 @@ fn print_usage() {
     println!("    --params <JSON>       URL/Query parameters as JSON");
     println!("    --json <JSON>         Request body as JSON (POST/PATCH/PUT)");
     println!("    --upload <PATH>       Local file to upload as media content (multipart)");
+    println!("    --upload-content-type <MIME>  MIME type of the uploaded file (auto-detected from extension if omitted)");
     println!("    --output <PATH>       Output file path for binary responses");
     println!("    --format <FMT>        Output format: json (default), table, yaml, csv");
     println!("    --api-version <VER>   Override the API version (e.g., v2, v3)");
@@ -455,6 +490,9 @@ fn print_usage() {
     println!(
         "    GOOGLE_WORKSPACE_CLI_CONFIG_DIR          Override config directory (default: ~/.config/gws)"
     );
+    println!(
+        "    GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND     Keyring backend: keyring (default) or file"
+    );
     println!("    GOOGLE_WORKSPACE_CLI_SANITIZE_TEMPLATE   Default Model Armor template");
     println!(
         "    GOOGLE_WORKSPACE_CLI_SANITIZE_MODE       Sanitization mode: warn (default) or block"
@@ -462,6 +500,15 @@ fn print_usage() {
     println!(
         "    GOOGLE_WORKSPACE_PROJECT_ID              Override the GCP project ID for quota and billing"
     );
+    println!("    GOOGLE_WORKSPACE_CLI_LOG                 Log level for stderr (e.g., gws=debug)");
+    println!(
+        "    GOOGLE_WORKSPACE_CLI_LOG_FILE            Directory for JSON log files (daily rotation)"
+    );
+    println!();
+    println!("EXIT CODES:");
+    for (code, description) in crate::error::EXIT_CODE_DOCUMENTATION {
+        println!("    {:<5}{}", code, description);
+    }
     println!();
     println!("COMMUNITY:");
     println!("    Star the repo: https://github.com/googleworkspace/cli");

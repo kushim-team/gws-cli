@@ -80,14 +80,21 @@ impl Helper for CalendarHelper {
                         .value_name("EMAIL")
                         .action(ArgAction::Append),
                 )
+                .arg(
+                    Arg::new("meet")
+                        .long("meet")
+                        .help("Add a Google Meet video conference link")
+                        .action(ArgAction::SetTrue),
+                )
                 .after_help("\
 EXAMPLES:
   gws calendar +insert --summary 'Standup' --start '2026-06-17T09:00:00-07:00' --end '2026-06-17T09:30:00-07:00'
   gws calendar +insert --summary 'Review' --start ... --end ... --attendee alice@example.com
+  gws calendar +insert --summary 'Meet' --start ... --end ... --meet
 
 TIPS:
   Use RFC3339 format for times (e.g. 2026-06-17T09:00:00-07:00).
-  For recurring events or conference links, use the raw API instead."),
+  The --meet flag automatically adds a Google Meet link to the event."),
         );
         cmd = cmd.subcommand(
             Command::new("+agenda")
@@ -122,6 +129,13 @@ TIPS:
                         .help("Filter to specific calendar name or ID")
                         .value_name("NAME"),
                 )
+                .arg(
+                    Arg::new("timezone")
+                        .long("timezone")
+                        .alias("tz")
+                        .help("IANA timezone override (e.g. America/Denver). Defaults to Google account timezone.")
+                        .value_name("TZ"),
+                )
                 .after_help(
                     "\
 EXAMPLES:
@@ -129,10 +143,12 @@ EXAMPLES:
   gws calendar +agenda --today
   gws calendar +agenda --week --format table
   gws calendar +agenda --days 3 --calendar 'Work'
+  gws calendar +agenda --today --timezone America/New_York
 
 TIPS:
   Read-only — never modifies events.
-  Queries all calendars by default; use --calendar to filter.",
+  Queries all calendars by default; use --calendar to filter.
+  Uses your Google account timezone by default; override with --timezone.",
                 ),
         );
         cmd
@@ -151,7 +167,8 @@ TIPS:
                 let scopes_str: Vec<&str> = scopes.iter().map(|s| s.as_str()).collect();
                 let (token, auth_method) = match auth::get_token(&scopes_str).await {
                     Ok(t) => (Some(t), executor::AuthMethod::OAuth),
-                    Err(_) => (None, executor::AuthMethod::None),
+                    Err(_) if matches.get_flag("dry-run") => (None, executor::AuthMethod::None),
+                    Err(e) => return Err(GwsError::Auth(format!("Calendar auth failed: {e}"))),
                 };
 
                 let events_res = doc.resources.get("events").ok_or_else(|| {
@@ -200,38 +217,45 @@ async fn handle_agenda(matches: &ArgMatches) -> Result<(), GwsError> {
         .map(|s| crate::formatter::OutputFormat::from_str(s))
         .unwrap_or(crate::formatter::OutputFormat::Table);
 
-    // Determine time range
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let client = crate::client::build_client()?;
+    let tz_override = matches.get_one::<String>("timezone").map(|s| s.as_str());
+    let tz = crate::timezone::resolve_account_timezone(&client, &token, tz_override).await?;
 
-    let days: u64 = if matches.get_flag("tomorrow") {
-        // Start from tomorrow, 1 day
+    // Determine time range using the account timezone so that --today and
+    // --tomorrow align with the user's Google account day, not the machine.
+    let now_in_tz = chrono::Utc::now().with_timezone(&tz);
+    let today_start_tz = crate::timezone::start_of_today(tz)?;
+
+    let days: i64 = if matches.get_flag("tomorrow") {
         1
     } else if matches.get_flag("week") {
         7
     } else {
         matches
             .get_one::<String>("days")
-            .and_then(|s| s.parse::<u64>().ok())
+            .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(1)
     };
 
-    let (time_min_epoch, time_max_epoch) = if matches.get_flag("tomorrow") {
-        // Tomorrow: start of tomorrow to end of tomorrow
-        let day_seconds = 86400;
-        let tomorrow_start = (now / day_seconds + 1) * day_seconds;
-        (tomorrow_start, tomorrow_start + day_seconds)
+    let (time_min_dt, time_max_dt) = if matches.get_flag("today") {
+        // Today: account tz midnight to midnight+1
+        let end = today_start_tz + chrono::Duration::days(1);
+        (today_start_tz, end)
+    } else if matches.get_flag("tomorrow") {
+        // Tomorrow: account tz midnight+1 to midnight+2
+        let start = today_start_tz + chrono::Duration::days(1);
+        let end = today_start_tz + chrono::Duration::days(2);
+        (start, end)
     } else {
-        // Start from now
-        (now, now + days * 86400)
+        // From now, N days ahead
+        let end = now_in_tz + chrono::Duration::days(days);
+        (now_in_tz, end)
     };
 
-    let time_min = epoch_to_rfc3339(time_min_epoch);
-    let time_max = epoch_to_rfc3339(time_max_epoch);
+    let time_min = time_min_dt.to_rfc3339();
+    let time_max = time_max_dt.to_rfc3339();
 
-    let client = crate::client::build_client()?;
+    // client already built above for timezone resolution
     let calendar_filter = matches.get_one::<String>("calendar");
 
     // 1. List all calendars
@@ -395,11 +419,6 @@ async fn handle_agenda(matches: &ArgMatches) -> Result<(), GwsError> {
     Ok(())
 }
 
-fn epoch_to_rfc3339(epoch: u64) -> String {
-    use chrono::{TimeZone, Utc};
-    Utc.timestamp_opt(epoch as i64, 0).unwrap().to_rfc3339()
-}
-
 fn build_insert_request(
     matches: &ArgMatches,
     doc: &crate::discovery::RestDescription,
@@ -441,13 +460,60 @@ fn build_insert_request(
         body["attendees"] = json!(attendees_list);
     }
 
+    let mut params = json!({
+        "calendarId": calendar_id
+    });
+
+    if matches.get_flag("meet") {
+        let namespace = uuid::Uuid::NAMESPACE_DNS;
+
+        let mut attendees: Vec<_> = matches
+            .get_many::<String>("attendee")
+            .map(|vals| vals.cloned().collect())
+            .unwrap_or_default();
+        attendees.sort();
+
+        let seed_payload = {
+            let mut map = serde_json::Map::new();
+            map.insert("v".to_string(), json!(1));
+            map.insert("summary".to_string(), json!(summary));
+            map.insert("start".to_string(), json!(start));
+            map.insert("end".to_string(), json!(end));
+            if let Some(loc) = location {
+                map.insert("location".to_string(), json!(loc));
+            }
+            if let Some(desc) = description {
+                map.insert("description".to_string(), json!(desc));
+            }
+            if !attendees.is_empty() {
+                let attendees_list_for_seed: Vec<_> = attendees
+                    .iter()
+                    .map(|email| json!({ "email": email }))
+                    .collect();
+                map.insert("attendees".to_string(), json!(attendees_list_for_seed));
+            }
+            serde_json::Value::Object(map)
+        };
+
+        let seed_data = serde_json::to_vec(&seed_payload).map_err(|e| {
+            GwsError::Other(anyhow::anyhow!(
+                "Failed to serialize seed payload for idempotency key: {e}"
+            ))
+        })?;
+        let request_id = uuid::Uuid::new_v5(&namespace, &seed_data).to_string();
+
+        body["conferenceData"] = json!({
+            "createRequest": {
+                "requestId": request_id,
+                "conferenceSolutionKey": { "type": "hangoutsMeet" }
+            }
+        });
+        params["conferenceDataVersion"] = json!(1);
+    }
     let body_str = body.to_string();
     let scopes: Vec<String> = insert_method.scopes.iter().map(|s| s.to_string()).collect();
 
     // events.insert requires 'calendarId' path parameter
-    let params = json!({
-        "calendarId": calendar_id
-    });
     let params_str = params.to_string();
 
     Ok((params_str, body_str, scopes))
@@ -485,7 +551,8 @@ mod tests {
                 Arg::new("attendee")
                     .long("attendee")
                     .action(ArgAction::Append),
-            );
+            )
+            .arg(Arg::new("meet").long("meet").action(ArgAction::SetTrue));
         cmd.try_get_matches_from(args).unwrap()
     }
 
@@ -507,6 +574,140 @@ mod tests {
         assert!(body.contains("Meeting"));
         assert!(body.contains("2024-01-01T10:00:00Z"));
         assert_eq!(scopes[0], "https://scope");
+    }
+
+    #[test]
+    fn test_build_insert_request_with_meet() {
+        let doc = make_mock_doc();
+        let matches = make_matches_insert(&[
+            "test",
+            "--summary",
+            "Meeting",
+            "--start",
+            "2024-01-01T10:00:00Z",
+            "--end",
+            "2024-01-01T11:00:00Z",
+            "--meet",
+        ]);
+        let (params, body, _) = build_insert_request(&matches, &doc).unwrap();
+
+        let params_json: serde_json::Value = serde_json::from_str(&params).unwrap();
+        assert_eq!(params_json["conferenceDataVersion"], 1);
+
+        let body_json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let create_req = &body_json["conferenceData"]["createRequest"];
+        assert_eq!(create_req["conferenceSolutionKey"]["type"], "hangoutsMeet");
+        assert!(uuid::Uuid::parse_str(create_req["requestId"].as_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn test_build_insert_request_with_meet_is_idempotent() {
+        let doc = make_mock_doc();
+        let args = &[
+            "test",
+            "--summary",
+            "Idempotent Meeting",
+            "--start",
+            "2024-01-01T10:00:00Z",
+            "--end",
+            "2024-01-01T11:00:00Z",
+            "--meet",
+        ];
+        let matches1 = make_matches_insert(args);
+        let (_, body1, _) = build_insert_request(&matches1, &doc).unwrap();
+
+        let matches2 = make_matches_insert(args);
+        let (_, body2, _) = build_insert_request(&matches2, &doc).unwrap();
+
+        let b1: serde_json::Value = serde_json::from_str(&body1).unwrap();
+        let b2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+
+        assert_eq!(
+            b1["conferenceData"]["createRequest"]["requestId"],
+            b2["conferenceData"]["createRequest"]["requestId"],
+            "requestId should be deterministic for the same event details"
+        );
+    }
+
+    #[test]
+    fn test_build_insert_request_with_meet_idempotency_robust() {
+        let doc = make_mock_doc();
+
+        // Base case
+        let args_base = &[
+            "test",
+            "--summary",
+            "S",
+            "--start",
+            "2024-01-01T10:00:00Z",
+            "--end",
+            "2024-01-01T11:00:00Z",
+            "--meet",
+            "--attendee",
+            "a@b.com",
+            "--attendee",
+            "c@d.com",
+        ];
+        let (_, body_base, _) =
+            build_insert_request(&make_matches_insert(args_base), &doc).unwrap();
+        let b_base: serde_json::Value = serde_json::from_str(&body_base).unwrap();
+        let id_base = b_base["conferenceData"]["createRequest"]["requestId"]
+            .as_str()
+            .unwrap();
+
+        // Same but different attendee order
+        let args_reordered = &[
+            "test",
+            "--summary",
+            "S",
+            "--start",
+            "2024-01-01T10:00:00Z",
+            "--end",
+            "2024-01-01T11:00:00Z",
+            "--meet",
+            "--attendee",
+            "c@d.com",
+            "--attendee",
+            "a@b.com",
+        ];
+        let (_, body_reordered, _) =
+            build_insert_request(&make_matches_insert(args_reordered), &doc).unwrap();
+        let b_reordered: serde_json::Value = serde_json::from_str(&body_reordered).unwrap();
+        let id_reordered = b_reordered["conferenceData"]["createRequest"]["requestId"]
+            .as_str()
+            .unwrap();
+
+        assert_eq!(
+            id_base, id_reordered,
+            "Attendee order should not change requestId"
+        );
+
+        // Different summary -> different ID
+        let args_diff = &[
+            "test",
+            "--summary",
+            "Diff",
+            "--start",
+            "2024-01-01T10:00:00Z",
+            "--end",
+            "2024-01-01T11:00:00Z",
+            "--meet",
+            "--attendee",
+            "a@b.com",
+            "--attendee",
+            "c@d.com",
+        ];
+        let (_, body_diff, _) =
+            build_insert_request(&make_matches_insert(args_diff), &doc).unwrap();
+        let b_diff: serde_json::Value = serde_json::from_str(&body_diff).unwrap();
+        let id_diff = b_diff["conferenceData"]["createRequest"]["requestId"]
+            .as_str()
+            .unwrap();
+
+        assert_ne!(
+            id_base, id_diff,
+            "Different summary should produce different requestId"
+        );
     }
 
     #[test]
@@ -535,5 +736,37 @@ mod tests {
         assert!(body.contains("Discuss stuff"));
         assert!(body.contains("a@b.com"));
         assert!(body.contains("c@d.com"));
+    }
+
+    /// Verify that agenda day boundaries use a specific timezone, not UTC.
+    #[test]
+    fn agenda_day_boundaries_use_account_timezone() {
+        use chrono::{NaiveTime, TimeZone, Utc};
+
+        // Simulate using a known account timezone (America/Denver = UTC-7 / UTC-6 DST)
+        let tz = chrono_tz::America::Denver;
+        let now_in_tz = Utc::now().with_timezone(&tz);
+        let today_start = now_in_tz
+            .date_naive()
+            .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+        let today_start_tz = tz
+            .from_local_datetime(&today_start)
+            .earliest()
+            .expect("midnight should resolve");
+
+        let today_rfc = today_start_tz.to_rfc3339();
+        let tomorrow_start = today_start_tz + chrono::Duration::days(1);
+        let tomorrow_rfc = tomorrow_start.to_rfc3339();
+
+        // The Denver offset should appear in the RFC3339 string (-07:00 or -06:00 for DST).
+        // Crucially, it should NOT be +00:00 (UTC).
+        assert!(
+            today_rfc.contains("-07:00") || today_rfc.contains("-06:00"),
+            "today boundary should carry Denver offset, got {today_rfc}"
+        );
+        assert!(
+            tomorrow_rfc.contains("-07:00") || tomorrow_rfc.contains("-06:00"),
+            "tomorrow boundary should carry Denver offset, got {tomorrow_rfc}"
+        );
     }
 }

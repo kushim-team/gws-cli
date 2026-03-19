@@ -21,6 +21,8 @@
 use crate::error::GwsError;
 use std::path::{Path, PathBuf};
 
+use crate::output::reject_dangerous_chars as reject_control_chars;
+
 /// Validates that `dir` is a safe output directory.
 ///
 /// The path is resolved relative to CWD. The function rejects paths that
@@ -118,16 +120,80 @@ pub fn validate_safe_dir_path(dir: &str) -> Result<PathBuf, GwsError> {
     Ok(canonical)
 }
 
-/// Rejects strings containing null bytes or ASCII control characters
-/// (including DEL, 0x7F).
-fn reject_control_chars(value: &str, flag_name: &str) -> Result<(), GwsError> {
-    if value.bytes().any(|b| b < 0x20 || b == 0x7F) {
+/// Validates that a file path (e.g. `--upload` or `--output`) is safe.
+///
+/// Rejects paths that escape above CWD via `..` traversal, contain
+/// control characters, or follow symlinks to locations outside CWD.
+/// Absolute paths are allowed (reading an existing file from a known
+/// location is legitimate) but the resolved target must still live
+/// under CWD.
+///
+/// # TOCTOU caveat
+///
+/// This is a best-effort defence-in-depth check. A local attacker with
+/// write access to a parent directory could replace a path component
+/// between this validation and the subsequent I/O. Fully eliminating
+/// TOCTOU would require `openat(O_NOFOLLOW)` on each path component,
+/// which is tracked as a follow-up for Unix platforms.
+pub fn validate_safe_file_path(path_str: &str, flag_name: &str) -> Result<PathBuf, GwsError> {
+    reject_control_chars(path_str, flag_name)?;
+
+    let path = Path::new(path_str);
+    let cwd = std::env::current_dir()
+        .map_err(|e| GwsError::Validation(format!("Failed to determine current directory: {e}")))?;
+
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+
+    // For existing files, canonicalize to resolve symlinks.
+    // For non-existing files, get the prefix canonicalized then normalize
+    // the remaining components to resolve any `..` or `.` segments.
+    let canonical = if resolved.exists() {
+        resolved.canonicalize().map_err(|e| {
+            GwsError::Validation(format!("Failed to resolve {flag_name} '{}': {e}", path_str))
+        })?
+    } else {
+        let raw = normalize_non_existing(&resolved)?;
+        // normalize_non_existing does NOT resolve `..` in the non-existent
+        // suffix. We must resolve them here to prevent bypass via paths like
+        // `non_existent/../../etc/passwd`.
+        normalize_dotdot(&raw)
+    };
+
+    let canonical_cwd = cwd.canonicalize().map_err(|e| {
+        GwsError::Validation(format!("Failed to canonicalize current directory: {e}"))
+    })?;
+
+    if !canonical.starts_with(&canonical_cwd) {
         return Err(GwsError::Validation(format!(
-            "{flag_name} contains invalid control characters"
+            "{flag_name} '{}' resolves to '{}' which is outside the current directory",
+            path_str,
+            canonical.display()
         )));
     }
-    Ok(())
+
+    Ok(canonical)
 }
+
+/// Resolve `.` and `..` components in a path without touching the filesystem.
+fn normalize_dotdot(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+// reject_control_chars is now a re-export from crate::output (see top of file)
 
 /// Resolves a path that may not exist yet by canonicalizing the existing
 /// prefix and appending remaining components.
@@ -201,7 +267,9 @@ pub fn validate_resource_name(s: &str) -> Result<&str, GwsError> {
             "Resource name must not contain path traversal ('..') segments: {s}"
         )));
     }
-    if s.contains('\0') || s.chars().any(|c| c.is_control()) {
+    if s.chars()
+        .any(|c| c == '\0' || c.is_control() || crate::output::is_dangerous_unicode(c))
+    {
         return Err(GwsError::Validation(format!(
             "Resource name contains invalid characters: {s}"
         )));
@@ -530,6 +598,112 @@ mod tests {
         assert!(validate_resource_name("spaces/100%").is_err());
     }
 
+    // --- reject_control_chars Unicode ---
+
+    #[test]
+    fn test_reject_control_chars_zero_width_space() {
+        // U+200B zero-width space
+        assert!(reject_control_chars("foo\u{200B}bar", "test").is_err());
+    }
+
+    #[test]
+    fn test_reject_control_chars_bom() {
+        // U+FEFF byte-order mark / zero-width no-break space
+        assert!(reject_control_chars("foo\u{FEFF}bar", "test").is_err());
+    }
+
+    #[test]
+    fn test_reject_control_chars_rtl_override() {
+        // U+202E RIGHT-TO-LEFT OVERRIDE
+        assert!(reject_control_chars("foo\u{202E}bar", "test").is_err());
+    }
+
+    #[test]
+    fn test_reject_control_chars_unicode_line_separator() {
+        // U+2028 LINE SEPARATOR
+        assert!(reject_control_chars("foo\u{2028}bar", "test").is_err());
+    }
+
+    #[test]
+    fn test_reject_control_chars_paragraph_separator() {
+        // U+2029 PARAGRAPH SEPARATOR
+        assert!(reject_control_chars("foo\u{2029}bar", "test").is_err());
+    }
+
+    #[test]
+    fn test_reject_control_chars_zero_width_joiner() {
+        // U+200D ZERO WIDTH JOINER
+        assert!(reject_control_chars("foo\u{200D}bar", "test").is_err());
+    }
+
+    #[test]
+    fn test_reject_control_chars_normal_unicode_ok() {
+        // CJK, accented characters and emoji should pass
+        assert!(reject_control_chars("日本語", "test").is_ok());
+        assert!(reject_control_chars("café", "test").is_ok());
+        assert!(reject_control_chars("αβγ", "test").is_ok());
+    }
+
+    // --- path validator Unicode (via validate_safe_output_dir) ---
+
+    #[test]
+    fn test_output_dir_rejects_zero_width_chars() {
+        // U+200B in a path segment
+        assert!(validate_safe_output_dir("foo\u{200B}bar").is_err());
+    }
+
+    #[test]
+    fn test_output_dir_rejects_rtl_override() {
+        assert!(validate_safe_output_dir("foo\u{202E}bar").is_err());
+    }
+
+    #[test]
+    fn test_output_dir_rejects_unicode_line_separator() {
+        assert!(validate_safe_output_dir("foo\u{2028}bar").is_err());
+    }
+
+    // --- validate_resource_name Unicode ---
+
+    #[test]
+    fn test_validate_resource_name_zero_width_chars() {
+        // U+200B, U+200D, U+FEFF all rejected
+        assert!(validate_resource_name("foo\u{200B}bar").is_err());
+        assert!(validate_resource_name("foo\u{200D}bar").is_err());
+        assert!(validate_resource_name("foo\u{FEFF}bar").is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_name_unicode_line_seps() {
+        assert!(validate_resource_name("foo\u{2028}bar").is_err());
+        assert!(validate_resource_name("foo\u{2029}bar").is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_name_rtl_override() {
+        assert!(validate_resource_name("foo\u{202E}bar").is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_name_bidi_embedding() {
+        // U+202A LEFT-TO-RIGHT EMBEDDING, U+202B RIGHT-TO-LEFT EMBEDDING
+        assert!(validate_resource_name("foo\u{202A}bar").is_err());
+        assert!(validate_resource_name("foo\u{202B}bar").is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_name_homoglyphs_pass_through() {
+        // Cyrillic lookalikes are intentionally allowed (homoglyph detection
+        // is out of scope for this validator — see validate_resource_name docs).
+        assert!(validate_resource_name("spaces/ΑΒС").is_ok()); // Cyrillic С
+    }
+
+    #[test]
+    fn test_validate_resource_name_overlong_accepted() {
+        // No length limit — documents current behaviour.
+        let long = "a".repeat(10_000);
+        assert!(validate_resource_name(&long).is_ok());
+    }
+
     // --- validate_api_identifier ---
 
     #[test]
@@ -565,5 +739,91 @@ mod tests {
     #[test]
     fn test_validate_api_identifier_empty() {
         assert!(validate_api_identifier("").is_err());
+    }
+
+    // --- validate_safe_file_path ---
+
+    #[test]
+    #[serial]
+    fn test_file_path_relative_is_ok() {
+        let dir = tempdir().unwrap();
+        let canonical_dir = dir.path().canonicalize().unwrap();
+        fs::write(canonical_dir.join("test.txt"), "data").unwrap();
+
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&canonical_dir).unwrap();
+
+        let result = validate_safe_file_path("test.txt", "--upload");
+        std::env::set_current_dir(&saved_cwd).unwrap();
+
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn test_file_path_rejects_traversal() {
+        let dir = tempdir().unwrap();
+        let canonical_dir = dir.path().canonicalize().unwrap();
+
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&canonical_dir).unwrap();
+
+        let result = validate_safe_file_path("../../etc/passwd", "--upload");
+        std::env::set_current_dir(&saved_cwd).unwrap();
+
+        assert!(result.is_err(), "path traversal should be rejected");
+        assert!(
+            result.unwrap_err().to_string().contains("outside"),
+            "error should mention 'outside'"
+        );
+    }
+
+    #[test]
+    fn test_file_path_rejects_control_chars() {
+        let result = validate_safe_file_path("file\x00.txt", "--output");
+        assert!(result.is_err(), "null bytes should be rejected");
+    }
+
+    #[test]
+    #[serial]
+    fn test_file_path_rejects_symlink_escape() {
+        let dir = tempdir().unwrap();
+        let canonical_dir = dir.path().canonicalize().unwrap();
+
+        // Create a symlink that points outside the directory
+        #[cfg(unix)]
+        {
+            let link_path = canonical_dir.join("escape");
+            std::os::unix::fs::symlink("/tmp", &link_path).unwrap();
+
+            let saved_cwd = std::env::current_dir().unwrap();
+            std::env::set_current_dir(&canonical_dir).unwrap();
+
+            let result = validate_safe_file_path("escape/secret.txt", "--output");
+            std::env::set_current_dir(&saved_cwd).unwrap();
+
+            assert!(result.is_err(), "symlink escape should be rejected");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_file_path_rejects_traversal_via_nonexistent_prefix() {
+        // Regression: non_existent/../../etc/passwd could bypass starts_with
+        // because normalize_non_existing preserves ".." in the non-existent
+        // suffix. The normalize_dotdot fix resolves this.
+        let dir = tempdir().unwrap();
+        let canonical_dir = dir.path().canonicalize().unwrap();
+
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&canonical_dir).unwrap();
+
+        let result = validate_safe_file_path("doesnt_exist/../../etc/passwd", "--output");
+        std::env::set_current_dir(&saved_cwd).unwrap();
+
+        assert!(
+            result.is_err(),
+            "traversal via non-existent prefix should be rejected"
+        );
     }
 }

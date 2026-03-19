@@ -1,5 +1,227 @@
 # @googleworkspace/cli
 
+## 0.18.1
+
+### Patch Changes
+
+- a87037b: Handle SIGTERM in `gws gmail +watch` and `gws events +subscribe` for clean container shutdown.
+
+  Long-running pull loops now exit gracefully on SIGTERM (in addition to Ctrl+C),
+  enabling clean shutdown under Kubernetes, Docker, and systemd.
+
+## 0.18.0
+
+### Minor Changes
+
+- 908cf73: feat(gmail): auto-populate From header with display name from send-as settings
+
+  Fetch the user's send-as identities to set the From header with a display name in all mail helpers (+send, +reply, +reply-all, +forward), matching Gmail web client behavior. Also enriches bare `--from` emails with their configured display name.
+
+- 6e4daaf: Gmail helpers rollup: mail-builder migration, --attach flag (upload endpoint), +read helper
+
+  - Migrate `+send`, `+reply`, `+reply-all`, and `+forward` to the `mail-builder` crate for RFC-compliant MIME construction
+  - Add `--from` flag to `+send` for send-as alias support
+  - Add `-a`/`--attach` flag to all mail helpers (`+send`, `+reply`, `+reply-all`, `+forward`) with `mime_guess2` auto-detection, 25MB size validation, and upload endpoint support (35MB API limit vs 5MB metadata-only)
+  - Add `+read` helper to extract message body and headers (text, HTML, or JSON output)
+  - Make `OriginalMessage.thread_id` optional (`Option<String>`) for draft compatibility
+  - RFC 2822 display name quoting is handled natively by `mail-builder`
+  - Introduce `UploadSource` enum in executor for type-safe upload strategies
+
+### Patch Changes
+
+- 1e90380: fix(gmail): remove dead `--attachment` arg from `+send`
+
+  The `+send` subcommand defined a duplicate `"attachment"` arg alongside the
+  `"attach"` arg already provided by `common_mail_args`. Since `parse_attachments`
+  reads `"attach"`, the `--attachment` flag was silently ignored. Removed the
+  dead duplicate.
+
+- 908cf73: fix(gmail): handle reply-all to own message correctly
+
+  Reply-all to a message you sent no longer errors with "No To recipient remains." The original To recipients are now used as reply targets, matching Gmail web client behavior.
+
+- 2e909ae: Consolidate terminal sanitization, coloring, and output helpers into a new `output.rs` module. Fixes raw ANSI escape codes in `watch.rs` that bypassed `NO_COLOR` and TTY detection, upgrades `sanitize_for_terminal` to also strip dangerous Unicode characters (bidi overrides, zero-width spaces, directional isolates), and sanitizes previously raw API error body and user query outputs.
+
+## 0.17.0
+
+### Minor Changes
+
+- 1b0a21f: feat: support google meet video conferencing in calendar +insert
+
+### Patch Changes
+
+- 811fe7b: Fix critical security vulnerability (TOCTOU/Symlink race) in atomic file writes.
+
+  The atomic_write and atomic_write_async utilities now use:
+
+  - Randomized temporary filenames to prevent predictability.
+  - O_EXCL creation flags to prevent following pre-existing symlinks.
+  - Strict 0600 permissions from the moment of file creation on Unix systems.
+  - Redundant post-write permission calls have been removed to close race windows.
+
+- b241a5b: fix(security): cap Retry-After sleep, sanitize upload mimeType, and validate --upload/--output paths
+- 6f92e5b: Stderr/output hygiene rollup: route diagnostics to stderr, add colored error labels, propagate auth errors.
+
+  - **triage.rs**: "No messages found" sent to stderr so stdout stays valid JSON for pipes
+  - **modelarmor.rs**: response body printed only on success; error message now includes body for diagnostics
+  - **error.rs**: colored `error[variant]:` labels on stderr (respects `NO_COLOR` env var), `hint:` prefix for accessNotConfigured guidance
+  - **calendar, chat, docs, drive, script, sheets**: auth failures now propagate as `GwsError::Auth` instead of silently proceeding unauthenticated (dry-run still works without auth)
+
+- 398e80c: Sync generated skills with latest Google Discovery API specs
+- 8458104: Extend input validation to reject dangerous Unicode characters (zero-width chars, bidi overrides, Unicode line/paragraph separators) that were not caught by the previous ASCII-range check
+
+## 0.16.0
+
+### Minor Changes
+
+- 47afe5f: Use Google account timezone instead of machine-local time for day-boundary calculations in calendar and workflow helpers. Adds `--timezone` flag to `+agenda` for explicit override. Timezone is fetched from Calendar Settings API and cached for 24 hours.
+
+### Patch Changes
+
+- c61b9cb: fix(gmail): RFC 2047 encode non-ASCII display names in To/From/Cc/Bcc headers
+
+  Fixes mojibake when sending emails to recipients with non-ASCII display names (e.g. Japanese, Spanish accented characters). The new `encode_address_header()` function parses mailbox lists, encodes only the display-name portion via RFC 2047 Base64, and leaves email addresses untouched.
+
+## 0.15.0
+
+### Minor Changes
+
+- 6f3e090: Add opt-in structured HTTP request logging via `tracing`
+
+  New environment variables:
+
+  - `GOOGLE_WORKSPACE_CLI_LOG`: stderr log filter (e.g., `gws=debug`)
+  - `GOOGLE_WORKSPACE_CLI_LOG_FILE`: directory for JSON log files with daily rotation
+
+  Logging is completely silent by default (zero overhead). Only PII-free metadata is logged: API method ID, HTTP method, status code, latency, and content-type.
+
+## 0.14.0
+
+### Minor Changes
+
+- dc561e0: Add `--upload-content-type` flag and smart MIME inference for multipart uploads
+
+  Previously, multipart uploads used the metadata `mimeType` field for both the Drive
+  metadata and the media part's `Content-Type` header. This made it impossible to upload
+  a file in one format (e.g. Markdown) and have Drive convert it to another (e.g. Google Docs),
+  because the media `Content-Type` and the target `mimeType` must differ for import conversions.
+
+  The new `--upload-content-type` flag allows setting the media `Content-Type` explicitly.
+  When omitted, the media type is now inferred from the file extension before falling back
+  to the metadata `mimeType`. This matches Google Drive's model where metadata `mimeType`
+  is the _target_ type (what the file should become) while the media `Content-Type` is the
+  _source_ type (what the bytes are).
+
+  This means import conversions now work automatically:
+
+  ```bash
+  # Extension inference detects text/markdown → conversion just works
+  gws drive files create \
+    --json '{"name":"My Doc","mimeType":"application/vnd.google-apps.document"}' \
+    --upload notes.md
+
+  # Explicit flag still available as an override
+  gws drive files create \
+    --json '{"name":"My Doc","mimeType":"application/vnd.google-apps.document"}' \
+    --upload notes.md \
+    --upload-content-type text/markdown
+  ```
+
+### Patch Changes
+
+- 945ac91: Stream multipart uploads to avoid OOM on large files. File content is now streamed in chunks via `ReaderStream` instead of being read entirely into memory, reducing memory usage from O(file_size) to O(64 KB).
+
+## 0.13.3
+
+### Patch Changes
+
+- 8ef27a2: fix(calendar): use local timezone for agenda day boundaries instead of UTC
+- 4d7b420: Fix `+append --json-values` flattening multi-row arrays into a single row by preserving the `Vec<Vec<String>>` row structure through to the API request body
+- bb94016: fix(security): validate space name in chat +send to prevent path traversal
+- 4b827cd: chore: fix maintainer email typo in flake.nix and harden coverage.sh
+- 44767ed: Map People service to `contacts` and `directory` scope prefixes so `gws auth login -s people` includes the required OAuth scopes
+- 8fce003: fix(docs): correct flag names in recipes (--spreadsheet-id, --attendees, --duration)
+- 21b1840: Expose `repeated: true` in `gws schema` output and expand JSON arrays into repeated query parameters for `repeated` fields
+- 1346d47: Sync generated skills with latest Google Discovery API specs
+- 957b999: test(gmail): add unit tests for +triage argument parsing and format selection
+
+## 0.13.2
+
+### Patch Changes
+
+- 3dcf818: Refresh OAuth access tokens for long-running Gmail watch and Workspace Events subscribe helpers before each Pub/Sub and Gmail request.
+- 86ea6de: Validate `--subscription` resource name in `gmail +watch` and deduplicate `PUBSUB_API_BASE` constant.
+
+## 0.13.1
+
+### Patch Changes
+
+- 510024f: Centralize token cache filenames as constants and support ServiceAccount credentials at the default plaintext path
+- 510024f: Auto-recover from stale encrypted credentials after upgrade: remove undecryptable `credentials.enc` and fall through to other credential sources (plaintext, ADC) instead of hard-erroring. Also sync encryption key file backup when keyring has key but file is missing.
+- e104106: Add shell tips section to gws-shared skill warning about zsh `!` history expansion, and replace single quotes with double quotes around sheet ranges containing `!` in recipes and skill examples
+
+## 0.13.0
+
+### Minor Changes
+
+- 9d937af: Add `--html` flag to `+send`, `+reply`, `+reply-all`, and `+forward` for HTML email composition.
+
+### Patch Changes
+
+- 2df32ee: Document helper commands (`+` prefix) in README
+
+  Adds a "Helper Commands" section to the Advanced Usage chapter explaining
+  the `+` prefix convention, listing all 24 helper commands across 10 services
+  with descriptions and usage examples.
+
+## 0.12.0
+
+### Minor Changes
+
+- 247e27a: Add structured exit codes for scriptable error handling
+
+  `gws` now exits with a type-specific code instead of always using `1`:
+
+  | Code | Meaning                                                         |
+  | ---- | --------------------------------------------------------------- |
+  | `0`  | Success                                                         |
+  | `1`  | API error — Google returned a 4xx/5xx response                  |
+  | `2`  | Auth error — credentials missing, expired, or invalid           |
+  | `3`  | Validation error — bad arguments, unknown service, invalid flag |
+  | `4`  | Discovery error — could not fetch the API schema document       |
+  | `5`  | Internal error — unexpected failure                             |
+
+  Exit codes are documented in `gws --help` and in the README.
+
+### Patch Changes
+
+- 087066f: Fix `gws auth login` encrypted credential persistence by enabling native keyring backends for the `keyring` crate on supported desktop platforms instead of silently falling back to the in-memory mock store.
+
+## 0.11.1
+
+### Patch Changes
+
+- adbca87: Fix `--format csv` for array-of-arrays responses (e.g. Sheets values API)
+
+## 0.11.0
+
+### Minor Changes
+
+- 4d4b09f: Add `--cc` and `--bcc` flags to `+send`, `--to` and `--bcc` to `+reply` and `+reply-all`, and `--bcc` to `+forward`.
+
+## 0.10.0
+
+### Minor Changes
+
+- 8d89325: Add `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND` env var for explicit keyring backend selection (`keyring` or `file`). Fixes credential key loss in Docker/keyring-less environments by never deleting `.encryption_key` and always persisting it as a fallback.
+
+### Patch Changes
+
+- 06aa698: fix(auth): dynamically fetch scopes from Discovery docs when `-s` specifies services not in static scope lists
+- 06aa698: fix(auth): format extract_scopes_from_doc and deduplicate dynamic scopes
+- 5e7d120: Bring `+forward` behavior in line with Gmail's web UI: keep the forward in the sender's original thread, add a blank line between the forwarded message metadata and body, and remove the spurious closing delimiter.
+- 2782cf1: Fix gmail +triage 403 error by using gmail.readonly scope instead of gmail.modify to avoid conflict with gmail.metadata scope that does not support the q parameter
+
 ## 0.9.1
 
 ### Patch Changes

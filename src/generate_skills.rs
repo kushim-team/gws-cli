@@ -19,6 +19,7 @@
 use crate::commands;
 use crate::discovery;
 use crate::error::GwsError;
+use crate::output::sanitize_for_terminal;
 use crate::services;
 use clap::Command;
 use std::path::Path;
@@ -123,7 +124,10 @@ pub async fn handle_generate_skills(args: &[String]) -> Result<(), GwsError> {
             match discovery::fetch_discovery_document(entry.api_name, entry.version).await {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("  WARNING: Failed to fetch discovery doc for {alias}: {e}");
+                    eprintln!(
+                        "  WARNING: Failed to fetch discovery doc for {alias}: {}",
+                        sanitize_for_terminal(&e.to_string())
+                    );
                     continue;
                 }
             }
@@ -721,6 +725,21 @@ gws <service> <resource> [sub-resource] <method> [flags]
 - **Always** confirm with user before executing write/delete commands
 - Prefer `--dry-run` for destructive operations
 - Use `--sanitize` for PII/content safety screening
+
+## Shell Tips
+
+- **zsh `!` expansion:** Sheet ranges like `Sheet1!A1` contain `!` which zsh interprets as history expansion. Use double quotes with escaped inner quotes instead of single quotes:
+  ```bash
+  # WRONG (zsh will mangle the !)
+  gws sheets +read --spreadsheet ID --range 'Sheet1!A1:D10'
+
+  # CORRECT
+  gws sheets +read --spreadsheet ID --range "Sheet1!A1:D10"
+  ```
+- **JSON with double quotes:** Wrap `--params` and `--json` values in single quotes so the shell does not interpret the inner double quotes:
+  ```bash
+  gws drive files list --params '{"pageSize": 5}'
+  ```
 
 ## Community & Feedback Etiquette
 

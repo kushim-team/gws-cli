@@ -74,6 +74,8 @@ Use `patch` for fixes/chores, `minor` for new features, `major` for breaking cha
 | `src/executor.rs`         | HTTP request construction, response handling, schema validation                           |
 | `src/schema.rs`           | `gws schema` command — introspect API method schemas                                      |
 | `src/error.rs`            | Structured JSON error output                                                              |
+| `src/logging.rs`          | Opt-in structured logging (stderr + file) via `tracing`                                   |
+| `src/timezone.rs`         | Account timezone resolution: `--timezone` flag, Calendar Settings API, 24h cache           |
 
 ## Demo Videos
 
@@ -182,3 +184,49 @@ Use these labels to categorize pull requests and issues:
 - `area: auth` — OAuth, credentials, multi-account, ADC
 - `area: skills` — AI skill generation and management
 
+## Environment Variables
+
+### Authentication
+
+| Variable | Description |
+|---|---|
+| `GOOGLE_WORKSPACE_CLI_TOKEN` | Pre-obtained OAuth2 access token (highest priority; bypasses all credential file loading) |
+| `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` | Path to OAuth credentials JSON (no default; if unset, falls back to encrypted credentials in `~/.config/gws/`) |
+| `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND` | Keyring backend: `keyring` (default, uses OS keyring with file fallback) or `file` (file only, for Docker/CI/headless) |
+
+| `GOOGLE_APPLICATION_CREDENTIALS` | Standard Google ADC path; used as fallback when no gws-specific credentials are configured |
+
+### Configuration
+
+| Variable | Description |
+|---|---|
+| `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` | Override the config directory (default: `~/.config/gws`) |
+
+### OAuth Client
+
+| Variable | Description |
+|---|---|
+| `GOOGLE_WORKSPACE_CLI_CLIENT_ID` | OAuth client ID (for `gws auth login` when no `client_secret.json` is saved) |
+| `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET` | OAuth client secret (paired with `CLIENT_ID` above) |
+
+### Sanitization (Model Armor)
+
+| Variable | Description |
+|---|---|
+| `GOOGLE_WORKSPACE_CLI_SANITIZE_TEMPLATE` | Default Model Armor template (overridden by `--sanitize` flag) |
+| `GOOGLE_WORKSPACE_CLI_SANITIZE_MODE` | `warn` (default) or `block` |
+
+### Helpers
+
+| Variable | Description |
+|---|---|
+| `GOOGLE_WORKSPACE_PROJECT_ID` | GCP project ID override for quota/billing and fallback for helper commands (overridden by `--project` flag) |
+
+### Logging
+
+| Variable | Description |
+|---|---|
+| `GOOGLE_WORKSPACE_CLI_LOG` | Log level filter for stderr output (e.g., `gws=debug`). Off by default. |
+| `GOOGLE_WORKSPACE_CLI_LOG_FILE` | Directory for JSON-line log files with daily rotation. Off by default. |
+
+All variables can also live in a `.env` file (loaded via `dotenvy`).

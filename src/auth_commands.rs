@@ -275,9 +275,15 @@ async fn handle_login(args: &[String]) -> Result<(), GwsError> {
         ..Default::default()
     };
 
-    // Ensure openid + email scopes are always present so we can identify the user
-    // via the userinfo endpoint after login.
-    let identity_scopes = ["openid", "https://www.googleapis.com/auth/userinfo.email"];
+    // Ensure openid + email + profile scopes are always present so we can
+    // identify the user via the userinfo endpoint after login, and so the
+    // Gmail helpers can fall back to the People API to populate the From
+    // display name when the send-as identity lacks one (Workspace accounts).
+    let identity_scopes = [
+        "openid",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+    ];
     for s in &identity_scopes {
         if !scopes.iter().any(|existing| existing == s) {
             scopes.push(s.to_string());
@@ -359,7 +365,7 @@ async fn handle_login(args: &[String]) -> Result<(), GwsError> {
             "message": "Authentication successful. Encrypted credentials saved.",
             "account": actual_email.as_deref().unwrap_or("(unknown)"),
             "credentials_file": enc_path.display().to_string(),
-            "encryption": "AES-256-GCM (key secured by OS Keyring or local `.encryption_key`)",
+            "encryption": "AES-256-GCM (key in OS keyring or local `.encryption_key`; set GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file for headless)",
             "scopes": scopes,
         });
         println!(
@@ -549,18 +555,23 @@ fn scope_matches_service(scope_url: &str, services: &HashSet<String>) -> bool {
     let prefix = short.split('.').next().unwrap_or(short);
 
     services.iter().any(|svc| {
-        let mapped_svc = map_service_to_scope_prefix(svc);
-        prefix == mapped_svc || short.starts_with(&format!("{mapped_svc}."))
+        let prefixes = map_service_to_scope_prefixes(svc);
+        prefixes
+            .iter()
+            .any(|mapped| prefix == *mapped || short.starts_with(&format!("{mapped}.")))
     })
 }
 
 /// Map user-friendly service names to their OAuth scope prefixes.
-fn map_service_to_scope_prefix(service: &str) -> &str {
+/// Some services map to multiple scope prefixes (e.g. People API uses
+/// both `contacts` and `directory` scopes).
+fn map_service_to_scope_prefixes(service: &str) -> Vec<&str> {
     match service {
-        "sheets" => "spreadsheets",
-        "slides" => "presentations",
-        "docs" => "documents",
-        s => s,
+        "sheets" => vec!["spreadsheets"],
+        "slides" => vec!["presentations"],
+        "docs" => vec!["documents"],
+        "people" => vec!["contacts", "directory"],
+        s => vec![s],
     }
 }
 
@@ -944,6 +955,7 @@ async fn handle_status() -> Result<(), GwsError> {
     let mut output = json!({
         "auth_method": auth_method,
         "storage": storage,
+        "keyring_backend": credential_store::active_backend_name(),
         "encrypted_credentials": enc_path.display().to_string(),
         "encrypted_credentials_exists": has_encrypted,
         "plain_credentials": plain_path.display().to_string(),
@@ -1185,6 +1197,9 @@ fn handle_logout() -> Result<(), GwsError> {
         }
     }
 
+    // Invalidate cached account timezone (may belong to old account)
+    crate::timezone::invalidate_cache();
+
     let output = if removed.is_empty() {
         json!({
             "status": "success",
@@ -1343,8 +1358,11 @@ fn find_unmatched_services(scopes: &[String], services: &HashSet<String>) -> Has
             if matched_services.contains(service) {
                 continue;
             }
-            let mapped_svc = map_service_to_scope_prefix(service);
-            if prefix == mapped_svc || short.starts_with(&format!("{mapped_svc}.")) {
+            let prefixes = map_service_to_scope_prefixes(service);
+            if prefixes
+                .iter()
+                .any(|mapped| prefix == *mapped || short.starts_with(&format!("{mapped}.")))
+            {
                 matched_services.insert(service.clone());
             }
         }
@@ -1555,6 +1573,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn config_dir_returns_gws_subdir() {
         let path = config_dir();
         assert!(path.ends_with("gws"));
@@ -1921,6 +1940,40 @@ mod tests {
         let services: HashSet<String> = ["drive"].iter().map(|s| s.to_string()).collect();
         assert!(!scope_matches_service(
             "https://www.googleapis.com/auth/driveactivity",
+            &services
+        ));
+    }
+
+    #[test]
+    fn scope_matches_service_people_contacts() {
+        let services: HashSet<String> = ["people"].iter().map(|s| s.to_string()).collect();
+        assert!(scope_matches_service(
+            "https://www.googleapis.com/auth/contacts",
+            &services
+        ));
+        assert!(scope_matches_service(
+            "https://www.googleapis.com/auth/contacts.readonly",
+            &services
+        ));
+        assert!(scope_matches_service(
+            "https://www.googleapis.com/auth/contacts.other.readonly",
+            &services
+        ));
+        assert!(scope_matches_service(
+            "https://www.googleapis.com/auth/directory.readonly",
+            &services
+        ));
+    }
+
+    #[test]
+    fn scope_matches_service_chat() {
+        let services: HashSet<String> = ["chat"].iter().map(|s| s.to_string()).collect();
+        assert!(scope_matches_service(
+            "https://www.googleapis.com/auth/chat.spaces",
+            &services
+        ));
+        assert!(scope_matches_service(
+            "https://www.googleapis.com/auth/chat.messages",
             &services
         ));
     }

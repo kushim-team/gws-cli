@@ -22,12 +22,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Context;
+use futures_util::stream::TryStreamExt;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
 use tokio::io::AsyncWriteExt;
 
 use crate::discovery::{RestDescription, RestMethod};
 use crate::error::GwsError;
+use crate::output::sanitize_for_terminal;
 
 /// Tracks what authentication method was used for the request.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +38,26 @@ pub enum AuthMethod {
     OAuth,
     /// No authentication was provided
     None,
+}
+
+/// Source for media upload content.
+///
+/// Two mutually exclusive strategies: upload from a file on disk (for Drive,
+/// Chat, etc.) or from in-memory bytes (for Gmail's constructed RFC 5322
+/// messages). Using an enum makes illegal states (both set, or mismatched
+/// content types) unrepresentable.
+pub enum UploadSource<'a> {
+    /// Stream from a file on disk. Content type is inferred from the file
+    /// extension, overridden by metadata mimeType, or explicitly set.
+    File {
+        path: &'a str,
+        content_type: Option<&'a str>,
+    },
+    /// Upload from in-memory bytes with an explicit content type.
+    Bytes {
+        data: &'a [u8],
+        content_type: &'a str,
+    },
 }
 
 /// Configuration for auto-pagination.
@@ -65,7 +87,7 @@ struct ExecutionInput {
     params: Map<String, Value>,
     body: Option<Value>,
     full_url: String,
-    query_params: HashMap<String, String>,
+    query_params: Vec<(String, String)>,
     is_upload: bool,
 }
 
@@ -75,7 +97,7 @@ fn parse_and_validate_inputs(
     method: &RestMethod,
     params_json: Option<&str>,
     body_json: Option<&str>,
-    upload_path: Option<&str>,
+    is_media_upload: bool,
 ) -> Result<ExecutionInput, GwsError> {
     let params: Map<String, Value> = if let Some(p) = params_json {
         serde_json::from_str(p)
@@ -122,8 +144,8 @@ fn parse_and_validate_inputs(
         }
     }
 
-    let (full_url, query_params) = build_url(doc, method, &params, upload_path.is_some())?;
-    let is_upload = upload_path.is_some() && method.supports_media_upload;
+    let (full_url, query_params) = build_url(doc, method, &params, is_media_upload)?;
+    let is_upload = is_media_upload && method.supports_media_upload;
 
     Ok(ExecutionInput {
         params,
@@ -144,7 +166,7 @@ async fn build_http_request(
     auth_method: &AuthMethod,
     page_token: Option<&str>,
     pages_fetched: u32,
-    upload_path: Option<&str>,
+    upload: &Option<UploadSource<'_>>,
 ) -> Result<reqwest::RequestBuilder, GwsError> {
     let mut request = match method.http_method.as_str() {
         "GET" => client.get(&input.full_url),
@@ -170,29 +192,41 @@ async fn build_http_request(
         request = request.header("x-goog-user-project", quota_project);
     }
 
-    for (key, value) in &input.query_params {
-        request = request.query(&[(key, value)]);
-    }
-
+    let mut all_query_params = input.query_params.clone();
     if let Some(pt) = page_token {
-        request = request.query(&[("pageToken", pt)]);
+        all_query_params.push(("pageToken".to_string(), pt.to_string()));
+    }
+    if !all_query_params.is_empty() {
+        request = request.query(&all_query_params);
     }
 
     if pages_fetched == 0 {
-        if input.is_upload {
-            let upload_path = upload_path.expect("upload_path must be Some when is_upload is true");
-
-            let file_bytes = tokio::fs::read(upload_path).await.map_err(|e| {
-                GwsError::Validation(format!(
-                    "Failed to read upload file '{}': {}",
-                    upload_path, e
-                ))
-            })?;
-
+        if let Some(upload_source) = upload {
             request = request.query(&[("uploadType", "multipart")]);
-            let (multipart_body, content_type) = build_multipart_body(&input.body, &file_bytes)?;
+            let (body, content_type, content_length) = match upload_source {
+                UploadSource::Bytes { data, content_type } => {
+                    if content_type.contains('\r') || content_type.contains('\n') {
+                        return Err(GwsError::Validation(
+                            "Upload content type must not contain CR or LF".to_string(),
+                        ));
+                    }
+                    build_multipart_bytes(&input.body, data, content_type)?
+                }
+                UploadSource::File { path, content_type } => {
+                    let file_meta = tokio::fs::metadata(path).await.map_err(|e| {
+                        GwsError::Validation(format!(
+                            "Failed to get metadata for upload file '{}': {}",
+                            path, e
+                        ))
+                    })?;
+                    let file_size = file_meta.len();
+                    let media_mime = resolve_upload_mime(*content_type, Some(path), &input.body);
+                    build_multipart_stream(&input.body, path, file_size, &media_mime)?
+                }
+            };
             request = request.header("Content-Type", content_type);
-            request = request.body(multipart_body);
+            request = request.header("Content-Length", content_length);
+            request = request.body(body);
         } else if let Some(ref body_val) = input.body {
             request = request.header("Content-Type", "application/json");
             request = request.json(body_val);
@@ -254,7 +288,10 @@ async fn handle_json_response(
                     }
                 }
                 Err(e) => {
-                    eprintln!("⚠️  Model Armor sanitization failed: {e}");
+                    eprintln!(
+                        "⚠️  Model Armor sanitization failed: {}",
+                        sanitize_for_terminal(&e.to_string())
+                    );
                 }
             }
         }
@@ -391,7 +428,7 @@ pub async fn execute_method(
     token: Option<&str>,
     auth_method: AuthMethod,
     output_path: Option<&str>,
-    upload_path: Option<&str>,
+    upload: Option<UploadSource<'_>>,
     dry_run: bool,
     pagination: &PaginationConfig,
     sanitize_template: Option<&str>,
@@ -399,7 +436,7 @@ pub async fn execute_method(
     output_format: &crate::formatter::OutputFormat,
     capture_output: bool,
 ) -> Result<Option<Value>, GwsError> {
-    let input = parse_and_validate_inputs(doc, method, params_json, body_json, upload_path)?;
+    let input = parse_and_validate_inputs(doc, method, params_json, body_json, upload.is_some())?;
 
     if dry_run {
         let dry_run_info = json!({
@@ -434,11 +471,14 @@ pub async fn execute_method(
             &auth_method,
             page_token.as_deref(),
             pages_fetched,
-            upload_path,
+            &upload,
         )
         .await?;
 
+        let method_id = method.id.as_deref().unwrap_or("unknown");
+        let start = std::time::Instant::now();
         let response = request.send().await.context("HTTP request failed")?;
+        let latency_ms = start.elapsed().as_millis() as u64;
 
         let status = response.status();
         let content_type = response
@@ -450,8 +490,26 @@ pub async fn execute_method(
 
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            tracing::warn!(
+                api_method = method_id,
+                http_method = %method.http_method,
+                status = status.as_u16(),
+                latency_ms = latency_ms,
+                "API error"
+            );
             return handle_error_response(status, &error_body, &auth_method);
         }
+
+        tracing::debug!(
+            api_method = method_id,
+            http_method = %method.http_method,
+            status = status.as_u16(),
+            latency_ms = latency_ms,
+            content_type = %content_type,
+            is_upload = input.is_upload,
+            page = pages_fetched,
+            "API request"
+        );
 
         let is_json =
             content_type.contains("application/json") || content_type.contains("text/json");
@@ -509,7 +567,7 @@ fn build_url(
     method: &RestMethod,
     params: &Map<String, Value>,
     is_upload: bool,
-) -> Result<(String, HashMap<String, String>), GwsError> {
+) -> Result<(String, Vec<(String, String)>), GwsError> {
     // Build URL base and path
 
     // Actually we need to construct base URL properly if not present
@@ -546,14 +604,9 @@ fn build_url(
 
     // Substitute path parameters and separate query parameters
     let path_parameters = extract_template_path_parameters(path_template);
-    let mut query_params: HashMap<String, String> = HashMap::new();
+    let mut query_params: Vec<(String, String)> = Vec::new();
 
     for (key, value) in params {
-        let val_str = match value {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-
         if path_parameters.contains(key.as_str()) {
             continue;
         }
@@ -571,8 +624,39 @@ fn build_url(
             )));
         }
 
-        // It's a query parameter
-        query_params.insert(key.clone(), val_str);
+        // For repeated parameters, expand JSON arrays into multiple query entries
+        let is_repeated = method
+            .parameters
+            .get(key)
+            .map(|p| p.repeated)
+            .unwrap_or(false);
+
+        if is_repeated {
+            if let Value::Array(arr) = value {
+                for item in arr {
+                    let val_str = match item {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    query_params.push((key.clone(), val_str));
+                }
+                continue;
+            }
+        }
+
+        if !is_repeated && value.is_array() {
+            eprintln!(
+                "Warning: parameter '{}' is not marked as repeated; array value will be stringified. \
+                 Use `gws schema` to check which parameters accept arrays.",
+                key
+            );
+        }
+
+        let val_str = match value {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        query_params.push((key.clone(), val_str));
     }
 
     let url_path = render_path_template(path_template, params)?;
@@ -753,21 +837,160 @@ fn handle_error_response<T>(
     })
 }
 
-/// Builds a multipart/related body for media upload requests.
+/// Resolves the MIME type for the uploaded media content.
+///
+/// Priority:
+/// 1. `--upload-content-type` flag (explicit override)
+/// 2. File extension inference (best guess for what the bytes actually are)
+/// 3. Metadata `mimeType` (fallback for backward compatibility)
+/// 4. `application/octet-stream`
+///
+/// Extension inference ranks above metadata `mimeType` because in Google
+/// Drive's multipart model, metadata `mimeType` represents the *target* type
+/// (what the file should become in Drive), while the media `Content-Type`
+/// represents the *source* type (what the bytes are). When a user uploads
+/// `notes.md` with `"mimeType":"application/vnd.google-apps.document"`, the
+/// media part should be `text/markdown`, not a Google Workspace MIME type.
+/// All returned MIME types have control characters stripped to prevent
+/// MIME header injection via user-controlled metadata.
+fn resolve_upload_mime(
+    explicit: Option<&str>,
+    upload_path: Option<&str>,
+    metadata: &Option<Value>,
+) -> String {
+    let raw = explicit
+        .map(|s| s.to_string())
+        .or_else(|| {
+            upload_path.and_then(|path| mime_guess2::from_path(path).first().map(|m| m.to_string()))
+        })
+        .or_else(|| {
+            metadata
+                .as_ref()
+                .and_then(|m| m.get("mimeType"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    // Strip CR/LF and other control characters to prevent MIME header injection.
+    let sanitized: String = raw.chars().filter(|c| !c.is_control()).collect();
+    if sanitized.is_empty() {
+        "application/octet-stream".to_string()
+    } else {
+        sanitized
+    }
+}
+
+/// Builds a streaming multipart/related body for media upload requests.
+///
+/// Instead of reading the entire file into memory, this streams the file in
+/// chunks via `ReaderStream`, keeping memory usage at O(64 KB) regardless of
+/// file size. The `Content-Length` is pre-computed from file metadata so Google
+/// APIs still receive the correct header without buffering.
+///
+/// Returns `(body, content_type, content_length)`.
+fn build_multipart_stream(
+    metadata: &Option<Value>,
+    file_path: &str,
+    file_size: u64,
+    media_mime: &str,
+) -> Result<(reqwest::Body, String, u64), GwsError> {
+    let boundary = format!("gws_boundary_{:016x}", rand::random::<u64>());
+
+    let media_mime = media_mime.to_string();
+
+    let metadata_json = match metadata {
+        Some(m) => serde_json::to_string(m).map_err(|e| {
+            GwsError::Validation(format!("Failed to serialize upload metadata: {e}"))
+        })?,
+        None => "{}".to_string(),
+    };
+
+    let preamble = format!(
+        "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata_json}\r\n\
+         --{boundary}\r\nContent-Type: {media_mime}\r\n\r\n"
+    );
+    let postamble = format!("\r\n--{boundary}--\r\n");
+
+    let content_length = preamble.len() as u64 + file_size + postamble.len() as u64;
+    let content_type = format!("multipart/related; boundary={boundary}");
+
+    let preamble_bytes: bytes::Bytes = preamble.into_bytes().into();
+    let postamble_bytes: bytes::Bytes = postamble.into_bytes().into();
+
+    let file_path_owned = file_path.to_owned();
+    let file_stream = futures_util::stream::once(async move {
+        tokio::fs::File::open(&file_path_owned).await.map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to open upload file '{}': {}", file_path_owned, e),
+            )
+        })
+    })
+    .map_ok(tokio_util::io::ReaderStream::new)
+    .try_flatten();
+
+    let stream = futures_util::stream::once(async { Ok::<_, std::io::Error>(preamble_bytes) })
+        .chain(file_stream)
+        .chain(futures_util::stream::once(async {
+            Ok::<_, std::io::Error>(postamble_bytes)
+        }));
+
+    Ok((
+        reqwest::Body::wrap_stream(stream),
+        content_type,
+        content_length,
+    ))
+}
+
+/// Builds a multipart/related body from in-memory bytes.
+///
+/// Used when the upload content is constructed in memory (e.g., a Gmail RFC 5322
+/// message with attachments) rather than read from a file on disk.
+fn build_multipart_bytes(
+    metadata: &Option<Value>,
+    data: &[u8],
+    media_mime: &str,
+) -> Result<(reqwest::Body, String, u64), GwsError> {
+    let boundary = format!("gws_boundary_{:016x}", rand::random::<u64>());
+
+    let metadata_json = match metadata {
+        Some(m) => serde_json::to_string(m).map_err(|e| {
+            GwsError::Validation(format!("Failed to serialize upload metadata: {e}"))
+        })?,
+        None => "{}".to_string(),
+    };
+
+    let preamble = format!(
+        "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata_json}\r\n\
+         --{boundary}\r\nContent-Type: {media_mime}\r\n\r\n"
+    );
+    let postamble = format!("\r\n--{boundary}--\r\n");
+
+    let mut body = Vec::with_capacity(preamble.len() + data.len() + postamble.len());
+    body.extend_from_slice(preamble.as_bytes());
+    body.extend_from_slice(data);
+    body.extend_from_slice(postamble.as_bytes());
+
+    let content_length = body.len() as u64;
+    let content_type = format!("multipart/related; boundary={boundary}");
+
+    Ok((reqwest::Body::from(body), content_type, content_length))
+}
+
+/// Builds a buffered multipart/related body for media upload requests.
+///
+/// This is the legacy implementation retained for unit tests that need
+/// a fully materialized body to assert against.
 ///
 /// Returns the body bytes and the Content-Type header value (with boundary).
+#[cfg(test)]
 fn build_multipart_body(
     metadata: &Option<Value>,
     file_bytes: &[u8],
+    media_mime: &str,
 ) -> Result<(Vec<u8>, String), GwsError> {
     let boundary = format!("gws_boundary_{:016x}", rand::random::<u64>());
-
-    // Determine the media MIME type from the metadata's mimeType field, or fall back
-    let media_mime = metadata
-        .as_ref()
-        .and_then(|m| m.get("mimeType"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("application/octet-stream");
 
     // Build multipart/related body
     let metadata_json = metadata
@@ -991,7 +1214,9 @@ pub fn mime_to_extension(mime: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::{JsonSchema, JsonSchemaProperty, RestDescription, RestMethod};
+    use crate::discovery::{
+        JsonSchema, JsonSchemaProperty, MethodParameter, RestDescription, RestMethod,
+    };
     use serde_json::json;
 
     #[test]
@@ -1213,7 +1438,7 @@ mod tests {
         let metadata = Some(json!({ "name": "test.txt", "mimeType": "text/plain" }));
         let content = b"Hello world";
 
-        let (body, content_type) = build_multipart_body(&metadata, content).unwrap();
+        let (body, content_type) = build_multipart_body(&metadata, content, "text/plain").unwrap();
 
         // Check content type has boundary
         assert!(content_type.starts_with("multipart/related; boundary="));
@@ -1234,13 +1459,172 @@ mod tests {
         let metadata = None;
         let content = b"Binary data";
 
-        let (body, content_type) = build_multipart_body(&metadata, content).unwrap();
+        let (body, content_type) =
+            build_multipart_body(&metadata, content, "application/octet-stream").unwrap();
         let boundary = content_type.split("boundary=").nth(1).unwrap();
         let body_str = String::from_utf8(body).unwrap();
 
         assert!(body_str.contains(boundary));
-        assert!(body_str.contains("application/octet-stream")); // Fallback mime
+        assert!(body_str.contains("application/octet-stream"));
         assert!(body_str.contains("Binary data"));
+    }
+
+    #[test]
+    fn test_resolve_upload_mime_explicit_flag() {
+        let metadata = Some(json!({ "mimeType": "image/png" }));
+        let mime = resolve_upload_mime(Some("text/markdown"), Some("file.txt"), &metadata);
+        assert_eq!(mime, "text/markdown", "explicit flag takes top priority");
+    }
+
+    #[test]
+    fn test_resolve_upload_mime_extension_beats_metadata() {
+        let metadata = Some(json!({ "mimeType": "application/vnd.google-apps.document" }));
+        let mime = resolve_upload_mime(None, Some("notes.md"), &metadata);
+        assert_eq!(
+            mime, "text/markdown",
+            "extension inference ranks above metadata mimeType"
+        );
+    }
+
+    #[test]
+    fn test_resolve_upload_mime_metadata_fallback_for_unknown_extension() {
+        let metadata = Some(json!({ "mimeType": "text/plain" }));
+        let mime = resolve_upload_mime(None, Some("file.unknown"), &metadata);
+        assert_eq!(
+            mime, "text/plain",
+            "metadata mimeType is used when extension is unrecognized"
+        );
+    }
+
+    #[test]
+    fn test_resolve_upload_mime_extension_when_no_metadata() {
+        let mime = resolve_upload_mime(None, Some("notes.md"), &None);
+        assert_eq!(mime, "text/markdown");
+
+        let mime = resolve_upload_mime(None, Some("page.html"), &None);
+        assert_eq!(mime, "text/html");
+
+        let mime = resolve_upload_mime(None, Some("data.csv"), &None);
+        assert_eq!(mime, "text/csv");
+    }
+
+    #[test]
+    fn test_resolve_upload_mime_fallback() {
+        let mime = resolve_upload_mime(None, Some("file.unknown"), &None);
+        assert_eq!(mime, "application/octet-stream");
+    }
+
+    #[test]
+    fn test_resolve_upload_mime_explicit_enables_import_conversion() {
+        let metadata = Some(json!({ "mimeType": "application/vnd.google-apps.document" }));
+        let mime = resolve_upload_mime(Some("text/markdown"), Some("impact.md"), &metadata);
+        assert_eq!(
+            mime, "text/markdown",
+            "--upload-content-type overrides metadata for media part"
+        );
+    }
+
+    #[test]
+    fn test_build_multipart_bytes_with_metadata() {
+        let metadata = Some(json!({ "threadId": "thread-123" }));
+        let data = b"From: test@example.com\r\nSubject: Test\r\n\r\nBody";
+        let (_, content_type, content_length) =
+            build_multipart_bytes(&metadata, data, "message/rfc822").unwrap();
+
+        assert!(
+            content_type.starts_with("multipart/related; boundary=gws_boundary_"),
+            "content_type should be multipart/related: {content_type}",
+        );
+        // Content-length should cover: preamble + data + postamble
+        assert!(
+            content_length > data.len() as u64,
+            "content_length should exceed raw data size: {content_length}",
+        );
+    }
+
+    #[test]
+    fn test_build_multipart_bytes_without_metadata() {
+        let (_, content_type, content_length) =
+            build_multipart_bytes(&None, b"test body", "message/rfc822").unwrap();
+
+        assert!(content_type.starts_with("multipart/related; boundary="));
+        assert!(content_length > 0);
+    }
+
+    #[tokio::test]
+    async fn test_build_multipart_stream_content_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("small.txt");
+        let file_content = b"Hello stream";
+        std::fs::write(&file_path, file_content).unwrap();
+
+        let metadata = Some(json!({ "name": "small.txt" }));
+        let file_size = file_content.len() as u64;
+
+        let (_body, content_type, declared_len) = build_multipart_stream(
+            &metadata,
+            file_path.to_str().unwrap(),
+            file_size,
+            "text/plain",
+        )
+        .unwrap();
+
+        assert!(content_type.starts_with("multipart/related; boundary="));
+        let boundary = content_type.split("boundary=").nth(1).unwrap();
+
+        // Manually compute expected content length:
+        // preamble = "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{json}\r\n--{boundary}\r\nContent-Type: text/plain\r\n\r\n"
+        // postamble = "\r\n--{boundary}--\r\n"
+        let metadata_json = serde_json::to_string(&metadata.unwrap()).unwrap();
+        let preamble = format!(
+            "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata_json}\r\n\
+             --{boundary}\r\nContent-Type: text/plain\r\n\r\n"
+        );
+        let postamble = format!("\r\n--{boundary}--\r\n");
+        let expected = preamble.len() as u64 + file_size + postamble.len() as u64;
+        assert_eq!(
+            declared_len, expected,
+            "declared Content-Length must match expected preamble + file + postamble"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_multipart_stream_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("large.bin");
+        // 256 KB — larger than the default 64 KB ReaderStream chunk size
+        let data = vec![0xABu8; 256 * 1024];
+        std::fs::write(&file_path, &data).unwrap();
+
+        let metadata = None;
+        let file_size = data.len() as u64;
+
+        let (_body, _content_type, declared_len) = build_multipart_stream(
+            &metadata,
+            file_path.to_str().unwrap(),
+            file_size,
+            "application/octet-stream",
+        )
+        .unwrap();
+
+        // Content-Length must account for the empty-metadata preamble + large file + postamble
+        assert!(
+            declared_len > file_size,
+            "Content-Length ({declared_len}) must be larger than file size ({file_size}) due to multipart framing"
+        );
+
+        // Verify exact arithmetic: preamble overhead + file_size + postamble
+        let boundary = _content_type.split("boundary=").nth(1).unwrap();
+        let preamble = format!(
+            "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{{}}\r\n\
+             --{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n"
+        );
+        let postamble = format!("\r\n--{boundary}--\r\n");
+        let expected = preamble.len() as u64 + file_size + postamble.len() as u64;
+        assert_eq!(
+            declared_len, expected,
+            "Content-Length must match for multi-chunk files"
+        );
     }
 
     #[test]
@@ -1294,7 +1678,46 @@ mod tests {
 
         let (url, query) = build_url(&doc, &method, &params, false).unwrap();
         assert_eq!(url, "https://api.example.com/files");
-        assert_eq!(query.get("q").unwrap(), "search term");
+        assert_eq!(query, vec![("q".to_string(), "search term".to_string())]);
+    }
+
+    #[test]
+    fn test_build_url_repeated_query_param_expands_array() {
+        let doc = RestDescription {
+            base_url: Some("https://api.example.com/".to_string()),
+            ..Default::default()
+        };
+        let mut method_params = HashMap::new();
+        method_params.insert(
+            "metadataHeaders".to_string(),
+            MethodParameter {
+                param_type: Some("string".to_string()),
+                location: Some("query".to_string()),
+                repeated: true,
+                ..Default::default()
+            },
+        );
+        let method = RestMethod {
+            path: "messages".to_string(),
+            flat_path: Some("messages".to_string()),
+            parameters: method_params,
+            ..Default::default()
+        };
+        let mut params = Map::new();
+        params.insert(
+            "metadataHeaders".to_string(),
+            json!(["Subject", "Date", "From"]),
+        );
+
+        let (_url, query) = build_url(&doc, &method, &params, false).unwrap();
+        assert_eq!(
+            query,
+            vec![
+                ("metadataHeaders".to_string(), "Subject".to_string()),
+                ("metadataHeaders".to_string(), "Date".to_string()),
+                ("metadataHeaders".to_string(), "From".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1900,7 +2323,7 @@ async fn test_post_without_body_sets_content_length_zero() {
         full_url: "https://example.com/messages/trash".to_string(),
         body: None,
         params: Map::new(),
-        query_params: HashMap::new(),
+        query_params: Vec::new(),
         is_upload: false,
     };
 
@@ -1912,7 +2335,7 @@ async fn test_post_without_body_sets_content_length_zero() {
         &AuthMethod::None,
         None,
         0,
-        None,
+        &None,
     )
     .await
     .unwrap();
@@ -1940,7 +2363,7 @@ async fn test_post_with_body_does_not_add_content_length_zero() {
         full_url: "https://example.com/files".to_string(),
         body: Some(json!({"name": "test"})),
         params: Map::new(),
-        query_params: HashMap::new(),
+        query_params: Vec::new(),
         is_upload: false,
     };
 
@@ -1952,7 +2375,7 @@ async fn test_post_with_body_does_not_add_content_length_zero() {
         &AuthMethod::None,
         None,
         0,
-        None,
+        &None,
     )
     .await
     .unwrap();
@@ -1978,7 +2401,7 @@ async fn test_get_does_not_set_content_length_zero() {
         full_url: "https://example.com/files".to_string(),
         body: None,
         params: Map::new(),
-        query_params: HashMap::new(),
+        query_params: Vec::new(),
         is_upload: false,
     };
 
@@ -1990,7 +2413,7 @@ async fn test_get_does_not_set_content_length_zero() {
         &AuthMethod::None,
         None,
         0,
-        None,
+        &None,
     )
     .await
     .unwrap();

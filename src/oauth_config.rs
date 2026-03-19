@@ -84,13 +84,6 @@ pub fn save_client_config(
     crate::fs_util::atomic_write(&path, json.as_bytes())
         .map_err(|e| anyhow::anyhow!("Failed to write client config: {e}"))?;
 
-    // Set file permissions to 600 on Unix (contains secrets)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-
     Ok(path)
 }
 

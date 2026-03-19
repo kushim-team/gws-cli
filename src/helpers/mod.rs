@@ -27,6 +27,69 @@ pub mod script;
 pub mod sheets;
 pub mod workflows;
 
+/// Base URL for the Google Cloud Pub/Sub v1 API.
+///
+/// Shared across `events::subscribe` and `gmail::watch` so the constant
+/// is defined in a single place.
+pub(crate) const PUBSUB_API_BASE: &str = "https://pubsub.googleapis.com/v1";
+
+/// Returns a future that completes when a shutdown signal is received.
+///
+/// On Unix this listens for both SIGINT (Ctrl+C) and SIGTERM; on other
+/// platforms only SIGINT is handled. Used by long-running pull loops
+/// (`gmail::watch`, `events::subscribe`) to exit cleanly under container
+/// orchestrators (Kubernetes, Docker, systemd) that send SIGTERM.
+///
+/// The signal handler is registered once in a background task on first call
+/// so it remains active for the lifetime of the process — no gap between
+/// loop iterations.
+pub(crate) async fn shutdown_signal() {
+    use std::sync::OnceLock;
+    use tokio::sync::Notify;
+
+    static NOTIFY: OnceLock<std::sync::Arc<Notify>> = OnceLock::new();
+
+    let notify = NOTIFY.get_or_init(|| {
+        let n = std::sync::Arc::new(Notify::new());
+        let n2 = n.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                match signal(SignalKind::terminate()) {
+                    Ok(mut sigterm) => {
+                        tokio::select! {
+                            res = tokio::signal::ctrl_c() => {
+                                res.expect("failed to listen for SIGINT");
+                            }
+                            Some(_) = sigterm.recv() => {}
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "warning: could not register SIGTERM handler: {e}. \
+                             Listening for Ctrl+C only."
+                        );
+                        tokio::signal::ctrl_c()
+                            .await
+                            .expect("failed to listen for SIGINT");
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("failed to listen for SIGINT");
+            }
+            n2.notify_waiters();
+        });
+        n
+    });
+
+    notify.notified().await;
+}
+
 /// A trait for service-specific CLI helpers that inject custom commands.
 pub trait Helper: Send + Sync {
     /// Injects subcommands into the service command.

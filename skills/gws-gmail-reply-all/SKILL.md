@@ -27,11 +27,15 @@ gws gmail +reply-all --message-id <ID> --body <TEXT>
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
 | `--message-id` | ✓ | — | Gmail message ID to reply to |
-| `--body` | ✓ | — | Reply body (plain text) |
+| `--body` | ✓ | — | Reply body (plain text, or HTML with --html) |
 | `--from` | — | — | Sender address (for send-as/alias; omit to use account default) |
-| `--cc` | — | — | Additional CC recipients (comma-separated) |
-| `--remove` | — | — | Exclude recipients from the outgoing reply (comma-separated emails) |
+| `--to` | — | — | Additional To email address(es), comma-separated |
+| `--attach` | — | — | Attach a file (can be specified multiple times) |
+| `--cc` | — | — | CC email address(es), comma-separated |
+| `--bcc` | — | — | BCC email address(es), comma-separated |
+| `--html` | — | — | Treat --body as HTML content (default is plain text) |
 | `--dry-run` | — | — | Show the request that would be sent without executing it |
+| `--remove` | — | — | Exclude recipients from the outgoing reply (comma-separated emails) |
 
 ## Examples
 
@@ -39,14 +43,21 @@ gws gmail +reply-all --message-id <ID> --body <TEXT>
 gws gmail +reply-all --message-id 18f1a2b3c4d --body 'Sounds good to me!'
 gws gmail +reply-all --message-id 18f1a2b3c4d --body 'Updated' --remove bob@example.com
 gws gmail +reply-all --message-id 18f1a2b3c4d --body 'Adding Eve' --cc eve@example.com
+gws gmail +reply-all --message-id 18f1a2b3c4d --body '<i>Noted</i>' --html
+gws gmail +reply-all --message-id 18f1a2b3c4d --body 'Notes attached' -a notes.pdf
 ```
 
 ## Tips
 
 - Replies to the sender and all original To/CC recipients.
+- Use --to to add extra recipients to the To field.
+- Use --cc to add new CC recipients.
+- Use --bcc for recipients who should not be visible to others.
 - Use --remove to exclude recipients from the outgoing reply, including the sender or Reply-To target.
-- The command fails if exclusions leave no reply target.
-- Use --cc to add new recipients.
+- The command fails if no To recipient remains after exclusions and --to additions.
+- Use -a/--attach to add file attachments. Can be specified multiple times.
+- With --html, the quoted block uses Gmail's gmail_quote CSS classes and preserves HTML formatting. Use fragment tags (<p>, <b>, <a>, etc.) — no <html>/<body> wrapper needed.
+- With --html, inline images in the quoted message (cid: references) will appear broken. Externally hosted images are unaffected.
 
 ## See Also
 

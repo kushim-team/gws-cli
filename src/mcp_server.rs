@@ -1136,7 +1136,7 @@ async fn execute_mcp_method(
         .transpose()
         .map_err(|e| GwsError::Validation(format!("Failed to serialize body: {e}")))?;
 
-    let upload_path = if let Some(raw) = arguments
+    let upload_source = if let Some(raw) = arguments
         .get("upload")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
@@ -1148,7 +1148,10 @@ async fn execute_mcp_method(
                 raw
             )));
         }
-        Some(raw)
+        Some(crate::executor::UploadSource::File {
+            path: raw,
+            content_type: None,
+        })
     } else {
         None
     };
@@ -1175,7 +1178,7 @@ async fn execute_mcp_method(
         token.as_deref(),
         auth_method,
         None,
-        upload_path,
+        upload_source,
         false,
         &pagination,
         None,

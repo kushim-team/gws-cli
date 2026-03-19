@@ -14,51 +14,96 @@
 
 //! File-system utilities.
 
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 
 /// Write `data` to `path` atomically.
 ///
-/// The data is first written to a temporary file alongside the target
-/// (e.g. `credentials.enc.tmp`) and then renamed into place.  On POSIX
-/// systems `rename(2)` is atomic with respect to crashes, so a reader of
-/// `path` will always see either the old or the new content — never a
-/// partially-written file.
+/// This implementation uses `tempfile::NamedTempFile` to create a temporary
+/// file with a random name, `O_EXCL` flags (preventing symlink attacks),
+/// and secure 0600 permissions from the moment of creation.
 ///
 /// # Errors
 ///
-/// Returns an `io::Error` if the temporary file cannot be written or if the
-/// rename fails.
+/// Returns an `io::Error` if the temporary file cannot be created/written or if the
+/// final rename fails.
 pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
-    // Derive a sibling tmp path, e.g. `/home/user/.config/gws/credentials.enc.tmp`
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let tmp_name = format!("{}.tmp", file_name.to_string_lossy());
-    let tmp_path = path
-        .parent()
-        .map(|p| p.join(&tmp_name))
-        .unwrap_or_else(|| std::path::PathBuf::from(&tmp_name));
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
+    })?;
 
-    std::fs::write(&tmp_path, data)?;
-    std::fs::rename(&tmp_path, path)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(data)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)
+        .map_err(|e| io::Error::new(e.error.kind(), e.error))?;
+
     Ok(())
 }
 
 /// Async variant of [`atomic_write`] for use with tokio.
+///
+/// This implementation uses `create_new(true)` (O_EXCL) and `mode(0o600)` to
+/// prevent TOCTOU/symlink race conditions.
 pub async fn atomic_write_async(path: &Path, data: &[u8]) -> io::Result<()> {
+    use rand::Rng;
+    use tokio::io::AsyncWriteExt;
+
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
+    })?;
     let file_name = path
         .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let tmp_name = format!("{}.tmp", file_name.to_string_lossy());
-    let tmp_path = path
-        .parent()
-        .map(|p| p.join(&tmp_name))
-        .unwrap_or_else(|| std::path::PathBuf::from(&tmp_name));
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?
+        .to_string_lossy();
 
-    tokio::fs::write(&tmp_path, data).await?;
-    tokio::fs::rename(&tmp_path, path).await?;
-    Ok(())
+    let mut retries = 0;
+    let mut file: tokio::fs::File;
+    let mut tmp_path;
+
+    loop {
+        let suffix: String = rand::thread_rng()
+            .sample_iter(&rand::distributions::Alphanumeric)
+            .take(8)
+            .map(char::from)
+            .collect();
+        let tmp_name = format!("{}.tmp.{}", file_name, suffix);
+        tmp_path = parent.join(tmp_name);
+
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+
+        #[cfg(unix)]
+        {
+            opts.mode(0o600);
+        }
+
+        match opts.open(&tmp_path).await {
+            Ok(f) => {
+                file = f;
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && retries < 10 => {
+                retries += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let write_result = async {
+        file.write_all(data).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&tmp_path, path).await
+    }
+    .await;
+
+    if write_result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+    }
+
+    write_result
 }
 
 #[cfg(test)]
@@ -72,6 +117,13 @@ mod tests {
         let path = dir.path().join("credentials.enc");
         atomic_write(&path, b"hello").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"hello");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = fs::metadata(&path).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
     }
 
     #[test]
@@ -88,8 +140,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials.enc");
         atomic_write(&path, b"data").unwrap();
-        let tmp = dir.path().join("credentials.enc.tmp");
-        assert!(!tmp.exists(), "tmp file should be cleaned up by rename");
+        // Since we use random names, we just check that no .tmp files remain in the dir
+        let files: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|res| res.unwrap().file_name())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], "credentials.enc");
     }
 
     #[tokio::test]
@@ -98,5 +155,12 @@ mod tests {
         let path = dir.path().join("token_cache.json");
         atomic_write_async(&path, b"async hello").await.unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"async hello");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = fs::metadata(&path).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
     }
 }

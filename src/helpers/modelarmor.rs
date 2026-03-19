@@ -298,13 +298,13 @@ async fn model_armor_post(url: &str, body: &str) -> Result<(), GwsError> {
     let status = resp.status();
     let text = resp.text().await.context("Failed to read response")?;
 
-    println!("{text}");
-
     if !status.is_success() {
         return Err(GwsError::Other(anyhow::anyhow!(
-            "API returned status {status}"
+            "API returned status {status}: {text}"
         )));
     }
+
+    println!("{text}");
 
     Ok(())
 }
