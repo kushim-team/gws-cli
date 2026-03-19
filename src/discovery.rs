@@ -195,20 +195,27 @@ pub async fn fetch_discovery_document(
     let version =
         crate::validate::validate_api_identifier(version).map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // Disk cache is only useful for CLI mode where the process restarts on every
+    // invocation. In MCP server mode the tools list is held in memory for the
+    // lifetime of the instance, so hitting the filesystem is pointless (and the
+    // container image may not even have a writable home directory).
     let cache_dir = crate::auth_commands::config_dir().join("cache");
-    std::fs::create_dir_all(&cache_dir)?;
+    let disk_cache = std::fs::create_dir_all(&cache_dir).is_ok();
 
-    let cache_file = cache_dir.join(format!("{service}_{version}.json"));
-
-    // Check cache (24hr TTL)
-    if cache_file.exists() {
-        if let Ok(metadata) = std::fs::metadata(&cache_file) {
-            if let Ok(modified) = metadata.modified() {
-                if modified.elapsed().unwrap_or_default() < std::time::Duration::from_secs(86400) {
-                    let data = std::fs::read_to_string(&cache_file)?;
-                    let doc: RestDescription = serde_json::from_str(&data)?;
-                    tracing::debug!(service = %service, version = %version, "Discovery cache hit");
-                    return Ok(doc);
+    if disk_cache {
+        let cache_file = cache_dir.join(format!("{service}_{version}.json"));
+        // Check cache (24hr TTL)
+        if cache_file.exists() {
+            if let Ok(metadata) = std::fs::metadata(&cache_file) {
+                if let Ok(modified) = metadata.modified() {
+                    if modified.elapsed().unwrap_or_default()
+                        < std::time::Duration::from_secs(86400)
+                    {
+                        let data = std::fs::read_to_string(&cache_file)?;
+                        let doc: RestDescription = serde_json::from_str(&data)?;
+                        tracing::debug!(service = %service, version = %version, "Discovery cache hit");
+                        return Ok(doc);
+                    }
                 }
             }
         }
@@ -243,10 +250,10 @@ pub async fn fetch_discovery_document(
         alt_resp.text().await?
     };
 
-    // Write to cache
-    if let Err(e) = std::fs::write(&cache_file, &body) {
-        // Non-fatal: just warn via stderr-safe approach
-        let _ = e;
+    // Write to disk cache if available.
+    if disk_cache {
+        let cache_file = cache_dir.join(format!("{service}_{version}.json"));
+        let _ = std::fs::write(&cache_file, &body);
     }
 
     let doc: RestDescription = serde_json::from_str(&body)?;

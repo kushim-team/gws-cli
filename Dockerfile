@@ -18,11 +18,6 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 
 RUN addgroup --system --gid 1001 appuser && adduser --system --uid 1001 --gid 1001 appuser
 
-# adduser --system sets HOME=/nonexistent in /etc/passwd.
-# dirs::home_dir() reads that, so config_dir() resolves to /nonexistent/.config/gws.
-# Create the cache directory there and make it writable.
-RUN mkdir -p /nonexistent/.config/gws/cache && chown -R appuser:appuser /nonexistent
-
 COPY --from=builder /app/target/release/gws /usr/local/bin/gws
 COPY config/ /app/config/
 
