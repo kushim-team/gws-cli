@@ -16,6 +16,7 @@ struct AppState {
     oauth_config: OAuthConfig,
     state_store: Arc<dyn StateStore>,
     permissions: Option<PermissionsConfig>,
+    upload_store: Mutex<super::upload_store::UploadStore>,
 }
 
 pub(super) async fn serve(
@@ -43,7 +44,17 @@ pub(super) async fn serve(
         oauth_config,
         state_store: store,
         permissions,
+        upload_store: Mutex::new(super::upload_store::UploadStore::new()),
     });
+
+    let upload_route = Router::new()
+        .route(
+            "/upload",
+            post(handle_upload).options(handle_cors_preflight),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(
+            super::upload_store::MAX_UPLOAD_SIZE,
+        ));
 
     let app = Router::new()
         .route("/mcp", post(handle_post))
@@ -60,6 +71,7 @@ pub(super) async fn serve(
             "/register",
             post(handle_register).options(handle_cors_preflight),
         )
+        .merge(upload_route)
         .layer(axum::extract::DefaultBodyLimit::max(1_048_576))
         .layer(axum::middleware::from_fn(security_headers_middleware))
         .with_state(state);
@@ -286,6 +298,7 @@ async fn handle_post(
                     &state.tools_cache,
                     &google_token,
                     &perm_ctx,
+                    &state.upload_store,
                 )
                 .await;
             }
@@ -300,6 +313,7 @@ async fn handle_post(
             &state.tools_cache,
             &google_token,
             &perm_ctx,
+            &state.upload_store,
         )
         .await;
         let response = build_jsonrpc_response(&id, result);
@@ -375,6 +389,62 @@ async fn handle_delete(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         return resp;
     }
     StatusCode::OK.into_response()
+}
+
+// ---- Upload endpoint ----
+
+/// POST /upload — accept raw file bytes and return an upload_id.
+///
+/// The client sends the file content as the request body with
+/// the appropriate `Content-Type` header. The server stores the
+/// data temporarily and returns a JSON response:
+///
+/// ```json
+/// {"upload_id": "<uuid>"}
+/// ```
+///
+/// The `upload_id` can then be passed to media-upload MCP tools
+/// via the `upload_ref` parameter. The upload is consumed on first
+/// use and expires after 10 minutes.
+async fn handle_upload(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if !validate_origin(&headers, &state.allowed_origins) {
+        return (StatusCode::FORBIDDEN, "Invalid Origin").into_response();
+    }
+    // Require valid Bearer token
+    if let Err(resp) = resolve_google_token(&headers, &state).await {
+        return resp;
+    }
+
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Empty upload body").into_response();
+    }
+
+    let upload_id = state
+        .upload_store
+        .lock()
+        .await
+        .insert(body.to_vec(), content_type);
+
+    let resp = json!({"upload_id": upload_id});
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        serde_json::to_string(&resp).unwrap(),
+    )
+        .into_response()
 }
 
 // ---- OAuth endpoints ----
@@ -1308,6 +1378,7 @@ mod tests {
             oauth_config: test_oauth_config(),
             state_store: store,
             permissions: None,
+            upload_store: Mutex::new(super::upload_store::UploadStore::new()),
         })
     }
 
