@@ -31,6 +31,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Google Workspace icon: 2×2 grid of colored squares (blue, red, green, yellow) as a data URI.
+const GWS_ICON_DATA_URI: &str = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA0OCA0OCI+PHJlY3QgeD0iMiIgeT0iMiIgd2lkdGg9IjIwIiBoZWlnaHQ9IjIwIiByeD0iNCIgZmlsbD0iIzQyODVGNCIvPjxyZWN0IHg9IjI2IiB5PSIyIiB3aWR0aD0iMjAiIGhlaWdodD0iMjAiIHJ4PSI0IiBmaWxsPSIjRUE0MzM1Ii8+PHJlY3QgeD0iMiIgeT0iMjYiIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgcng9IjQiIGZpbGw9IiMzNEE4NTMiLz48cmVjdCB4PSIyNiIgeT0iMjYiIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgcng9IjQiIGZpbGw9IiNGQkJDMDQiLz48L3N2Zz4=";
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ToolMode {
     Full,
@@ -479,7 +482,12 @@ async fn handle_request(
             "protocolVersion": "2024-11-05",
             "serverInfo": {
                 "name": "gws-mcp",
-                "version": env!("CARGO_PKG_VERSION")
+                "version": env!("CARGO_PKG_VERSION"),
+                "icons": [{
+                    "src": GWS_ICON_DATA_URI,
+                    "mimeType": "image/svg+xml",
+                    "sizes": ["any"]
+                }]
             },
             "capabilities": {
                 "tools": {}
@@ -499,13 +507,20 @@ async fn handle_request(
             // Filter tools by user permissions (scopes + optional allow patterns).
             let filtered = filter_tools_by_permissions(all_tools, perm_ctx);
 
-            // Strip internal `_scopes` metadata before sending to the client.
+            // Strip internal `_scopes` metadata and attach server icon before
+            // sending to the client.
+            let icon = json!([{
+                "src": GWS_ICON_DATA_URI,
+                "mimeType": "image/svg+xml",
+                "sizes": ["any"]
+            }]);
             let tools: Vec<Value> = filtered
                 .into_iter()
                 .map(|t| {
                     let mut t = t.clone();
                     if let Some(obj) = t.as_object_mut() {
                         obj.remove("_scopes");
+                        obj.insert("icons".to_string(), icon.clone());
                     }
                     t
                 })
