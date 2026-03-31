@@ -292,6 +292,8 @@ users:
     role: admin
   keisuke.funatsu@hodl1.jp:
     role: admin
+  noriko.kitano@hodl1.jp:
+    role: admin
 
   # ── reader ──
   hisao.araki@hodl1.jp:
@@ -313,8 +315,6 @@ users:
   hodaka.goto@hodl1.jp:
     role: reader
   mihoko.egami@hodl1.jp:
-    role: reader
-  noriko.kitano@hodl1.jp:
     role: reader
   junichi.ishigaki@hodl1.jp:
     role: reader
