@@ -20,7 +20,6 @@ mod jsonrpc;
 pub(crate) mod oauth;
 pub(crate) mod permissions;
 pub(crate) mod state_store;
-mod upload_store;
 
 use crate::discovery::RestResource;
 use crate::error::GwsError;
@@ -477,7 +476,6 @@ async fn handle_request(
     tools_cache: &Mutex<Option<Vec<Value>>>,
     access_token: &str,
     perm_ctx: &PermissionContext<'_>,
-    upload_store: &Mutex<upload_store::UploadStore>,
 ) -> Result<Value, GwsError> {
     match method {
         "initialize" => Ok(json!({
@@ -536,7 +534,7 @@ async fn handle_request(
             // MCP spec: tool execution errors should be returned as successful results
             // with isError: true, NOT as JSON-RPC protocol errors. Returning JSON-RPC
             // errors causes clients to show generic "Tool execution failed" with no detail.
-            match handle_tools_call(params, config, access_token, perm_ctx, upload_store).await {
+            match handle_tools_call(params, config, access_token, perm_ctx).await {
                 Ok(val) => Ok(val),
                 Err(e) => Ok(json!({
                     "content": [{ "type": "text", "text": e.to_string() }],
@@ -772,10 +770,17 @@ fn walk_resources(prefix: &str, resources: &HashMap<String, RestResource>, tools
             }
             if method.supports_media_upload {
                 properties.insert(
-                    "upload_ref".to_string(),
+                    "upload_content".to_string(),
                     json!({
                         "type": "string",
-                        "description": "Upload ID returned by POST /upload. Upload the file content to the /upload endpoint first, then pass the returned upload_id here."
+                        "description": "Base64-encoded file content to upload as media."
+                    }),
+                );
+                properties.insert(
+                    "upload_content_type".to_string(),
+                    json!({
+                        "type": "string",
+                        "description": "MIME type of the upload_content (e.g. 'application/pdf', 'text/markdown'). Required when upload_content is provided."
                     }),
                 );
             }
@@ -993,7 +998,6 @@ async fn handle_tools_call(
     config: &ServerConfig,
     access_token: &str,
     perm_ctx: &PermissionContext<'_>,
-    upload_store: &Mutex<upload_store::UploadStore>,
 ) -> Result<Value, GwsError> {
     let tool_name = params
         .get("name")
@@ -1063,16 +1067,8 @@ async fn handle_tools_call(
             }
         }
 
-        return execute_mcp_method(
-            &doc,
-            method,
-            arguments,
-            access_token,
-            perm_ctx,
-            tool_name,
-            upload_store,
-        )
-        .await;
+        return execute_mcp_method(&doc, method, arguments, access_token, perm_ctx, tool_name)
+            .await;
     }
 
     // Full mode: tool_name encodes service_resource_method (e.g., drive_files_list)
@@ -1135,41 +1131,42 @@ async fn handle_tools_call(
         }
     }
 
-    execute_mcp_method(
-        &doc,
-        method,
-        arguments,
-        access_token,
-        perm_ctx,
-        tool_name,
-        upload_store,
-    )
-    .await
+    execute_mcp_method(&doc, method, arguments, access_token, perm_ctx, tool_name).await
 }
 
-/// Resolve an upload reference from the in-memory upload store.
+/// Decode inline upload content from MCP tool arguments.
 ///
-/// If `"upload_ref"` is present in the arguments, takes the entry from
-/// the store (consuming it). Returns `None` if the parameter is absent.
-async fn resolve_upload_ref(
-    arguments: &Value,
-    upload_store: &Mutex<upload_store::UploadStore>,
-) -> Result<Option<upload_store::UploadEntry>, GwsError> {
-    let upload_id = match arguments
-        .get("upload_ref")
+/// Extracts `"upload_content"` (base64-encoded) and `"upload_content_type"`
+/// from the JSON arguments for remote MCP servers where the server cannot
+/// access local client files.
+fn decode_upload_content(arguments: &Value) -> Result<Option<(Vec<u8>, String)>, GwsError> {
+    let b64 = match arguments
+        .get("upload_content")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
     {
-        Some(id) => id,
+        Some(s) => s,
         None => return Ok(None),
     };
-    let entry = upload_store.lock().await.take(upload_id).ok_or_else(|| {
-        GwsError::Validation(format!(
-            "Upload reference '{}' not found or expired. Upload the file to POST /upload first.",
-            upload_id
-        ))
+    let content_type = arguments
+        .get("upload_content_type")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            GwsError::Validation(
+                "upload_content_type is required when upload_content is provided".to_string(),
+            )
+        })?;
+    if content_type.contains('\r') || content_type.contains('\n') {
+        return Err(GwsError::Validation(
+            "upload_content_type must not contain CR or LF".to_string(),
+        ));
+    }
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let data = STANDARD.decode(b64).map_err(|e| {
+        GwsError::Validation(format!("Failed to decode upload_content as base64: {e}"))
     })?;
-    Ok(Some(entry))
+    Ok(Some((data, content_type.to_string())))
 }
 
 async fn execute_mcp_method(
@@ -1179,7 +1176,6 @@ async fn execute_mcp_method(
     access_token: &str,
     perm_ctx: &PermissionContext<'_>,
     tool_name: &str,
-    upload_store: &Mutex<upload_store::UploadStore>,
 ) -> Result<Value, GwsError> {
     let params_json_val = arguments.get("params");
     let params_str = params_json_val
@@ -1197,13 +1193,10 @@ async fn execute_mcp_method(
         .transpose()
         .map_err(|e| GwsError::Validation(format!("Failed to serialize body: {e}")))?;
 
-    let upload_entry = resolve_upload_ref(arguments, upload_store).await?;
-    let upload_source = upload_entry
+    let inline_upload = decode_upload_content(arguments)?;
+    let upload_source = inline_upload
         .as_ref()
-        .map(|entry| crate::executor::UploadSource::Bytes {
-            data: &entry.data,
-            content_type: &entry.content_type,
-        });
+        .map(|(data, content_type)| crate::executor::UploadSource::Bytes { data, content_type });
 
     let page_all = arguments
         .get("page_all")
@@ -1318,7 +1311,6 @@ mod usage_stats_tests {
     #[tokio::test]
     async fn test_handle_request_initialize_with_email() {
         let tools_cache = Mutex::new(None);
-        let upload_store = Mutex::new(upload_store::UploadStore::new());
         let config = ServerConfig {
             services: vec![],
             workflows: false,
@@ -1333,7 +1325,6 @@ mod usage_stats_tests {
             &tools_cache,
             "test-token",
             &perm_ctx,
-            &upload_store,
         )
         .await;
         assert!(result.is_ok());
@@ -1344,7 +1335,6 @@ mod usage_stats_tests {
     #[tokio::test]
     async fn test_handle_request_initialize_without_email() {
         let tools_cache = Mutex::new(None);
-        let upload_store = Mutex::new(upload_store::UploadStore::new());
         let config = ServerConfig {
             services: vec![],
             workflows: false,
@@ -1359,7 +1349,6 @@ mod usage_stats_tests {
             &tools_cache,
             "test-token",
             &perm_ctx,
-            &upload_store,
         )
         .await;
         assert!(result.is_ok());
@@ -1368,7 +1357,6 @@ mod usage_stats_tests {
     #[tokio::test]
     async fn test_handle_request_tools_call_invalid_name_logs_error() {
         let tools_cache = Mutex::new(None);
-        let upload_store = Mutex::new(upload_store::UploadStore::new());
         let config = ServerConfig {
             services: vec!["drive".to_string()],
             workflows: false,
@@ -1384,7 +1372,6 @@ mod usage_stats_tests {
             &tools_cache,
             "test-token",
             &perm_ctx,
-            &upload_store,
         )
         .await;
         // tools/call errors are now wrapped as isError:true
@@ -1396,7 +1383,6 @@ mod usage_stats_tests {
     #[tokio::test]
     async fn test_handle_request_unsupported_method() {
         let tools_cache = Mutex::new(None);
-        let upload_store = Mutex::new(upload_store::UploadStore::new());
         let config = ServerConfig {
             services: vec![],
             workflows: false,
@@ -1411,7 +1397,6 @@ mod usage_stats_tests {
             &tools_cache,
             "test-token",
             &perm_ctx,
-            &upload_store,
         )
         .await;
         assert!(result.is_err());
@@ -1724,5 +1709,83 @@ mod tests {
         assert_eq!(tools.len(), 5);
         assert_eq!(tools[0]["name"], "workflow_standup_report");
         assert_eq!(tools[4]["name"], "workflow_file_announce");
+    }
+}
+
+#[cfg(test)]
+mod upload_content_tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    #[test]
+    fn test_decode_upload_content_none_when_absent() {
+        let args = json!({});
+        assert!(decode_upload_content(&args).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_decode_upload_content_none_when_empty() {
+        let args = json!({"upload_content": ""});
+        assert!(decode_upload_content(&args).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_decode_upload_content_requires_content_type() {
+        let b64 = STANDARD.encode(b"hello");
+        let args = json!({"upload_content": b64});
+        let result = decode_upload_content(&args);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("upload_content_type is required"));
+    }
+
+    #[test]
+    fn test_decode_upload_content_valid() {
+        let data = b"# Hello World\nThis is markdown.";
+        let b64 = STANDARD.encode(data);
+        let args = json!({
+            "upload_content": b64,
+            "upload_content_type": "text/markdown"
+        });
+        let result = decode_upload_content(&args).unwrap().unwrap();
+        assert_eq!(result.0, data);
+        assert_eq!(result.1, "text/markdown");
+    }
+
+    #[test]
+    fn test_decode_upload_content_binary() {
+        let data: Vec<u8> = (0..=255).collect();
+        let b64 = STANDARD.encode(&data);
+        let args = json!({
+            "upload_content": b64,
+            "upload_content_type": "application/octet-stream"
+        });
+        let result = decode_upload_content(&args).unwrap().unwrap();
+        assert_eq!(result.0, data);
+    }
+
+    #[test]
+    fn test_decode_upload_content_invalid_base64() {
+        let args = json!({
+            "upload_content": "not-valid-base64!!!",
+            "upload_content_type": "text/plain"
+        });
+        let result = decode_upload_content(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("base64"));
+    }
+
+    #[test]
+    fn test_decode_upload_content_rejects_crlf_in_content_type() {
+        let b64 = STANDARD.encode(b"data");
+        let args = json!({
+            "upload_content": b64,
+            "upload_content_type": "text/plain\r\nX-Injected: header"
+        });
+        let result = decode_upload_content(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("CR or LF"));
     }
 }

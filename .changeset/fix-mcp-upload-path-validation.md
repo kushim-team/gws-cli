@@ -2,4 +2,4 @@
 "@googleworkspace/cli": minor
 ---
 
-Add `POST /upload` endpoint and `upload_ref` parameter for MCP file uploads. Clients upload files via HTTP to `/upload` (up to 50 MiB), receive an `upload_id`, then pass it as `upload_ref` in media-upload tool calls (e.g. `drive_files_create`). This replaces the previous file-path-based `upload` parameter which was unusable for remote MCP servers.
+Add inline upload support for remote MCP servers via `upload_content` (base64) and `upload_content_type` parameters. This allows MCP clients to send file data directly without requiring server-side file access. Also harden file-path-based upload validation by reusing `validate_safe_file_path` from validate.rs.
