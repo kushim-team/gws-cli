@@ -1169,6 +1169,19 @@ fn decode_upload_content(arguments: &Value) -> Result<Option<(Vec<u8>, String)>,
     Ok(Some((data, content_type.to_string())))
 }
 
+/// Returns `true` when the MIME type represents text-based content that can be
+/// safely decoded as UTF-8 and returned as an MCP `text` content block instead
+/// of a binary `resource` blob.  Returning text avoids the Claude API
+/// attempting (and failing) to process the blob as an image.
+fn is_text_mime(mime: &str) -> bool {
+    mime.starts_with("text/")
+        || mime == "application/json"
+        || mime == "application/xml"
+        || mime == "application/javascript"
+        || mime.ends_with("+json")
+        || mime.ends_with("+xml")
+}
+
 async fn execute_mcp_method(
     doc: &crate::discovery::RestDescription,
     method: &crate::discovery::RestMethod,
@@ -1266,20 +1279,30 @@ async fn execute_mcp_method(
                 .unwrap_or("");
             let bytes = val.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
 
-            json!([
-                {
-                    "type": "resource",
-                    "resource": {
-                        "uri": format!("data:{};base64,", mime),
-                        "mimeType": mime,
-                        "blob": data
-                    }
-                },
-                {
+            if is_text_mime(mime) {
+                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                let decoded = STANDARD.decode(data).unwrap_or_default();
+                let text_content = String::from_utf8_lossy(&decoded);
+                json!([{
                     "type": "text",
-                    "text": format!("Binary file downloaded ({} bytes, {})", bytes, mime)
-                }
-            ])
+                    "text": text_content.to_string()
+                }])
+            } else {
+                json!([
+                    {
+                        "type": "resource",
+                        "resource": {
+                            "uri": format!("data:{};base64,", mime),
+                            "mimeType": mime,
+                            "blob": data
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": format!("Binary file downloaded ({} bytes, {})", bytes, mime)
+                    }
+                ])
+            }
         }
         Some(val) => {
             let text = serde_json::to_string_pretty(&val).unwrap_or_else(|_| "[]".to_string());
@@ -1787,5 +1810,41 @@ mod upload_content_tests {
         let result = decode_upload_content(&args);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("CR or LF"));
+    }
+}
+
+#[cfg(test)]
+mod is_text_mime_tests {
+    use super::is_text_mime;
+
+    #[test]
+    fn text_subtypes_are_text() {
+        assert!(is_text_mime("text/plain"));
+        assert!(is_text_mime("text/markdown"));
+        assert!(is_text_mime("text/html"));
+        assert!(is_text_mime("text/csv"));
+        assert!(is_text_mime("text/xml"));
+    }
+
+    #[test]
+    fn application_text_formats_are_text() {
+        assert!(is_text_mime("application/json"));
+        assert!(is_text_mime("application/xml"));
+        assert!(is_text_mime("application/javascript"));
+    }
+
+    #[test]
+    fn structured_suffixes_are_text() {
+        assert!(is_text_mime("application/vnd.google-apps.document+json"));
+        assert!(is_text_mime("application/atom+xml"));
+    }
+
+    #[test]
+    fn binary_types_are_not_text() {
+        assert!(!is_text_mime("application/octet-stream"));
+        assert!(!is_text_mime("application/pdf"));
+        assert!(!is_text_mime("image/png"));
+        assert!(!is_text_mime("image/jpeg"));
+        assert!(!is_text_mime("audio/mpeg"));
     }
 }
