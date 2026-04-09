@@ -1194,6 +1194,8 @@ pub fn mime_to_extension(mime: &str) -> &str {
         "xml"
     } else if mime.contains("html") {
         "html"
+    } else if mime.contains("markdown") {
+        "md"
     } else if mime.contains("plain") {
         "txt"
     } else if mime.contains("octet-stream") {
@@ -1236,6 +1238,7 @@ mod tests {
 
     #[test]
     fn test_mime_to_extension_more_types() {
+        assert_eq!(mime_to_extension("text/markdown"), "md");
         assert_eq!(mime_to_extension("text/plain"), "txt");
         assert_eq!(mime_to_extension("text/csv"), "csv");
         assert_eq!(mime_to_extension("application/zip"), "zip");
