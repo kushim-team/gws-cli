@@ -27,6 +27,7 @@ pub(crate) mod credential_store;
 mod discovery;
 mod error;
 mod executor;
+mod extraction;
 mod formatter;
 mod fs_util;
 mod generate_skills;

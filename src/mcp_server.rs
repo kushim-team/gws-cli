@@ -1288,20 +1288,48 @@ async fn execute_mcp_method(
                     "text": text_content.to_string()
                 }])
             } else {
-                json!([
-                    {
-                        "type": "resource",
-                        "resource": {
-                            "uri": format!("data:{};base64,", mime),
-                            "mimeType": mime,
-                            "blob": data
+                // Try text extraction for supported binary formats (docx, xlsx, pptx, pdf)
+                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                let extracted = if crate::extraction::is_extractable_mime(mime) {
+                    STANDARD.decode(data).ok().and_then(|raw_bytes| {
+                        match crate::extraction::extract_text(mime, &raw_bytes) {
+                            Ok(Some(text)) => Some(text),
+                            Ok(None) => None,
+                            Err(e) => {
+                                tracing::warn!(
+                                    mime = mime,
+                                    error = %e,
+                                    "binary document text extraction failed"
+                                );
+                                None
+                            }
                         }
-                    },
-                    {
+                    })
+                } else {
+                    None
+                };
+
+                if let Some(text) = extracted {
+                    json!([{
                         "type": "text",
-                        "text": format!("Binary file downloaded ({} bytes, {})", bytes, mime)
-                    }
-                ])
+                        "text": text
+                    }])
+                } else {
+                    json!([
+                        {
+                            "type": "resource",
+                            "resource": {
+                                "uri": format!("data:{};base64,", mime),
+                                "mimeType": mime,
+                                "blob": data
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": format!("Binary file downloaded ({} bytes, {})", bytes, mime)
+                        }
+                    ])
+                }
             }
         }
         Some(val) => {
